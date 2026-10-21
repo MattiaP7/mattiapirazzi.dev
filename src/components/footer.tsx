@@ -19,7 +19,7 @@ export async function Footer() {
   const currentYear = new Date().getFullYear();
 
   return (
-    <footer className="mt-20 border-t border-neutral-200 dark:border-neutral-800 bg-neutral-50/50 dark:bg-neutral-900/30 text-xs text-neutral-600 dark:text-neutral-400">
+    <footer className="mt-auto border-t border-neutral-200 dark:border-neutral-800 bg-neutral-50/50 dark:bg-neutral-900/30 text-xs text-neutral-600 dark:text-neutral-400">
       <div className="max-w-4xl mx-auto px-4 py-12 space-y-8">
         {/* Griglia principale: 1 colonna su mobile, 3 colonne su desktop */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
