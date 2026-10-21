@@ -1,0 +1,291 @@
+---
+title: "Crea il tuo text editor in C++23: visualizzare un file e scrolling"
+description: "Apriamo un file, lo memorizziamo come vettore di righe in editor/row.hpp, gestiamo tab, scrolling verticale e orizzontale e aggiungiamo la barra di stato."
+date: "2026-10-21"
+author: "Mattia"
+tags: ["c++", "c++23", "file", "scrolling", "text editor"]
+series: "crea-il-tuo-text-editor"
+order: 5
+---
+
+Finora l'editor non ha contenuto. In questa parte lo leghiamo a un file: lo leggiamo, lo mostriamo, e permettiamo di scorrerlo.
+
+Struttura del progetto a fine parte:
+
+```text
+ted/
+├── Makefile
+└── src/
+    ├── main.cpp                ← una riga in più
+    ├── terminal/
+    │   ├── raw_mode.hpp
+    │   ├── screen.hpp
+    │   └── input.hpp
+    └── editor/
+        ├── editor.hpp          ← modificato
+        └── row.hpp             ← nuovo
+```
+
+## editor/row.hpp: il modello dei dati
+
+Un file è una sequenza di righe. Ogni riga ha due rappresentazioni:
+
+- `chars`: i caratteri esattamente come stanno nel file;
+- `render`: come vanno **disegnati** a schermo. Il tab, per esempio, deve diventare un numero variabile di spazi fino al prossimo multiplo di 8.
+
+Mettere `Row` e le funzioni che la riguardano in un header a parte tiene separato il **dato** dall'**editor** che lo usa. Crea `src/editor/row.hpp`:
+
+```cpp
+#pragma once
+
+#include <string>
+
+namespace ted {
+
+constexpr int tab_stop = 8;
+
+struct Row {
+    std::string chars;
+    std::string render;
+};
+
+// ricostruisce render a partire da chars (espande i tab)
+inline void update_render(Row& r) {
+    r.render.clear();
+    for (char c : r.chars) {
+        if (c == '\t') {
+            r.render += ' ';
+            while (r.render.size() % tab_stop != 0) r.render += ' ';
+        } else {
+            r.render += c;
+        }
+    }
+}
+
+// il cursore vive in coordinate di chars, lo schermo mostra render
+inline int cx_to_rx(const Row& r, int cx) {
+    int rx = 0;
+    for (int j = 0; j < cx; ++j) {
+        if (r.chars[j] == '\t') rx += (tab_stop - 1) - (rx % tab_stop);
+        ++rx;
+    }
+    return rx;
+}
+
+}  // namespace ted
+```
+
+## editor/editor.hpp: nuovi membri
+
+Aggiungi gli include `<fstream>`, `<vector>` e `"editor/row.hpp"`, poi questi membri a `Editor`:
+
+```cpp
+std::vector<Row> rows;
+std::string filename;
+int rx = 0;                // posizione del cursore in render
+int row_off = 0;           // prima riga del file visibile
+int col_off = 0;           // prima colonna visibile
+```
+
+Nel costruttore, dopo aver letto la dimensione, riserviamo una riga per la barra di stato:
+
+```cpp
+screen_rows -= 1;
+```
+
+## Aprire un file
+
+Un unico punto, `update_row()`, si occupa di aggiornare una riga dopo ogni modifica. Per ora fa solo il render; nella parte 8 vi aggiungeremo i colori.
+
+```cpp
+void update_row(Row& r) { update_render(r); }
+
+void append_row(std::string s) {
+    Row r;
+    r.chars = std::move(s);
+    update_row(r);
+    rows.push_back(std::move(r));
+}
+
+void open(const std::string& path) {
+    filename = path;
+    std::ifstream f{path};
+
+    // file inesistente: buffer vuoto, lo creeremo al salvataggio
+    if (!f) 
+      return;                    
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        append_row(line);
+    }
+}
+```
+
+## main.cpp: due righe
+
+Dopo aver creato l'editor, passagli il file dalla riga di comando. Il resto di `main.cpp` resta identico:
+
+```cpp
+int main(int argc, char** argv) {
+    try {
+        auto raw = ted::RawMode::enable();
+        if (!raw) throw std::system_error{raw.error(), "tcsetattr"};
+
+        ted::Editor editor;
+        if (argc > 1) editor.open(argv[1]);
+        editor.run();
+    } catch (const std::exception& e) {
+        // ... invariato
+    }
+}
+```
+
+## Scrolling
+
+Il cursore `cy` ora è una posizione **nel file**, non sullo schermo. `row_off` e `col_off` dicono quale finestra del file stiamo guardando. Prima di disegnare, `scroll()` li aggiorna in modo che il cursore sia sempre visibile:
+
+```cpp
+void scroll() {
+    rx = 0;
+    if (cy < static_cast<int>(rows.size()))
+        rx = cx_to_rx(rows[cy], cx);
+
+    if (cy < row_off) row_off = cy;
+    if (cy >= row_off + screen_rows) row_off = cy - screen_rows + 1;
+    if (rx < col_off) col_off = rx;
+    if (rx >= col_off + screen_cols) col_off = rx - screen_cols + 1;
+}
+```
+
+## Disegnare le righe del file
+
+`draw_rows()` cambia: per ogni riga dello schermo calcoliamo quale riga del file mostrare. Il messaggio di benvenuto compare solo se non c'è nessun file. Ora **ogni** riga termina con `\r\n`, perché sotto metteremo la barra di stato:
+
+```cpp
+void draw_rows() {
+    for (int y = 0; y < screen_rows; ++y) {
+        int filerow = y + row_off;
+        if (filerow >= static_cast<int>(rows.size())) {
+            if (rows.empty() && y == screen_rows / 3) draw_welcome();
+            else out += '~';
+        } else {
+            const auto& r = rows[filerow].render;
+            int len = std::clamp(
+              static_cast<int>(r.size()) - col_off, 0, screen_cols
+            );
+            if (len > 0) out.append(r, col_off, len);
+        }
+        out += "\x1b[K\r\n";
+    }
+}
+```
+
+Attenzione a `static_cast<int>(r.size()) - col_off`: `size()` è un tipo **senza segno**, e sottrarre un valore più grande farebbe un underflow gigantesco. Con il cast a `int` il risultato è negativo e `std::clamp` lo riporta a 0.
+
+## Barra di stato
+
+Una riga in colori invertiti (`\x1b[7m` attiva, `\x1b[m` resetta) con nome del file e numero di righe a sinistra, posizione corrente a destra:
+
+```cpp
+void draw_status_bar() {
+    out += "\x1b[7m";
+    auto left = std::format("{:.20} - {} righe",
+                            filename.empty() ? "[senza nome]" : filename,
+                            rows.size());
+    auto right = std::format("{}/{}", cy + 1, rows.size());
+
+    int len = std::min(static_cast<int>(left.size()), screen_cols);
+    out.append(left, 0, len);
+    while (len < screen_cols) {
+        if (screen_cols - len == static_cast<int>(right.size())) {
+            out += right;
+            break;
+        }
+        out += ' ';
+        ++len;
+    }
+    out += "\x1b[m";
+}
+```
+
+`{:.20}` tronca il nome del file a 20 caratteri: `std::format` ci regala la precisione sulle stringhe senza codice extra.
+
+## refresh_screen aggiornato
+
+```cpp
+void refresh_screen() {
+    scroll();
+    out += "\x1b[?25l\x1b[H";
+    draw_rows();
+    draw_status_bar();
+    out += std::format("\x1b[{};{}H", cy - row_off + 1, rx - col_off + 1);
+    out += "\x1b[?25h";
+    flush();
+}
+```
+
+## move_cursor con i confini del file
+
+Il cursore deve rispettare le righe reali: non può andare oltre la fine di una riga, e andando a sinistra dall'inizio (o a destra dalla fine) salta alla riga adiacente:
+
+```cpp
+void move_cursor(int key) {
+    const Row* row = cy < static_cast<int>(rows.size()) ? &rows[cy] : nullptr;
+
+    switch (key) {
+    case ArrowLeft:
+        if (cx > 0) --cx;
+        else if (cy > 0) { --cy; cx = static_cast<int>(rows[cy].chars.size()); }
+        break;
+    case ArrowRight:
+        if (row && cx < static_cast<int>(row->chars.size())) ++cx;
+        else if (row && cx == static_cast<int>(row->chars.size())) { ++cy; cx = 0; }
+        break;
+    case ArrowUp:
+        if (cy > 0) --cy;
+        break;
+    case ArrowDown:
+        if (cy < static_cast<int>(rows.size())) ++cy;
+        break;
+    }
+
+    // se la nuova riga è più corta, riporta cx dentro la riga
+    row = cy < static_cast<int>(rows.size()) ? &rows[cy] : nullptr;
+    int len = row ? static_cast<int>(row->chars.size()) : 0;
+    cx = std::min(cx, len);
+}
+```
+
+In `process_keypress()` aggiorniamo Home, End e le pagine:
+
+```cpp
+case Home: cx = 0; break;
+case End:
+    if (cy < static_cast<int>(rows.size()))
+        cx = static_cast<int>(rows[cy].chars.size());
+    break;
+
+case PageUp:
+case PageDown:
+    if (c == PageUp) {
+        cy = row_off;
+    } else {
+        cy = std::min(row_off + screen_rows - 1, static_cast<int>(rows.size()));
+    }
+    for (int n = screen_rows; n > 0; --n)
+        move_cursor(c == PageUp ? ArrowUp : ArrowDown);
+    break;
+```
+
+## Provalo
+
+Apri un file, magari il sorgente stesso:
+
+```bash
+make run FILE=src/editor/editor.hpp
+```
+
+Scorri con le frecce e con Page Up/Down. Prova un file con righe molto lunghe e con tab: lo scrolling orizzontale e la conversione dei tab dovrebbero funzionare. Nella barra di stato vedi la riga corrente su quelle totali.
+
+Ora abbiamo un **viewer**. Nella prossima parte lo trasformiamo in un vero **editor**: inserire, cancellare, salvare.

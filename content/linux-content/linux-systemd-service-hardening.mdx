@@ -1,0 +1,149 @@
+---
+title: "Creare e mettere in sicurezza un servizio systemd"
+description: "Dalla unit file ai restart policy: come eseguire un programma come servizio Linux, leggere i log e applicare le direttive di hardening senza rompere il servizio."
+date: "2026-10-15"
+author: "Mattia Pirazzi"
+tags: ["Linux", "systemd", "sicurezza", "sysadmin"]
+coverImage: "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=1600&q=85"
+---
+
+# Creare e mettere in sicurezza un servizio systemd
+
+Su una macchina Linux, un programma che deve restare attivo non dovrebbe dipendere da una sessione SSH aperta o da un terminale dimenticato. `systemd` permette di definire un servizio con una configurazione dichiarativa: quale comando avviare, con quale utente, quando riavviarlo, quali dipendenze attendere e quali restrizioni applicare.
+
+Scrivere una unit file minima è semplice; scriverne una affidabile richiede invece di capire il tipo di processo, la gestione dei segnali, le directory di lavoro, i log e le conseguenze delle opzioni di sicurezza. Le direttive disponibili dipendono dalla versione di systemd e dalla distribuzione.
+
+## 1. Un servizio di esempio
+
+Supponiamo di avere un programma installato in `/opt/hello-service/bin/hello-service`. Una unit file può essere salvata in `/etc/systemd/system/hello-service.service`:
+
+```ini
+[Unit]
+Description=Hello Service
+After=network.target
+
+[Service]
+Type=exec
+User=hello
+Group=hello
+WorkingDirectory=/opt/hello-service
+ExecStart=/opt/hello-service/bin/hello-service
+Restart=on-failure
+RestartSec=3
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`[Unit]` descrive il servizio e le relazioni con altre unità. `After=network.target` definisce un ordinamento rispetto a quel target, ma non garantisce che una rete remota sia già raggiungibile o che il DNS funzioni. Se l'applicazione dipende da un servizio di rete specifico, dovrebbe comunque gestire retry e timeout.
+
+`[Service]` contiene il comportamento del processo. `User` e `Group` evitano di eseguire l'applicazione come root, se non è necessario. `WorkingDirectory` definisce la directory di lavoro, che può influire su percorsi relativi e file di configurazione. `Restart=on-failure` chiede a systemd di riavviare il servizio dopo alcuni tipi di terminazione anomala; non significa che qualsiasi configurazione errata verrà risolta dal riavvio.
+
+`Type=exec` è disponibile nelle versioni moderne di systemd e considera l'avvio riuscito quando il processo è stato eseguito correttamente. Su sistemi più vecchi potrebbe essere necessario `Type=simple`. Per un servizio che usa un protocollo di notifica esplicito si può valutare `Type=notify`; non bisogna dichiararlo se l'applicazione non invia la notifica prevista.
+
+## 2. Creare l'utente di servizio
+
+Un account dedicato limita i danni che un processo compromesso può causare. Per un servizio di sistema, l'account dovrebbe normalmente essere senza login interattivo e avere accesso soltanto ai dati necessari. La creazione dell'utente varia tra distribuzioni; su sistemi che supportano le opzioni mostrate, un esempio è:
+
+```bash
+sudo useradd \
+  --system \
+  --home-dir /var/lib/hello-service \
+  --create-home \
+  --shell /usr/sbin/nologin \
+  hello
+```
+
+Verifica che il percorso della shell esista sul sistema target. Poi assegna proprietà e permessi coerenti con l'applicazione. I file eseguibili possono essere leggibili ed eseguibili dall'utente di servizio senza essere modificabili da esso; i dati che devono cambiare durante l'esecuzione possono vivere in una directory separata, come `/var/lib/hello-service`.
+
+Non rendere automaticamente tutta la directory dell'applicazione scrivibile dal servizio. Se un processo può modificare il proprio eseguibile o i file di configurazione privilegiati, un bug applicativo può diventare un meccanismo di persistenza.
+
+## 3. Caricare, avviare e verificare
+
+Dopo aver salvato la unit file:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now hello-service.service
+sudo systemctl status hello-service.service
+```
+
+`daemon-reload` fa rileggere a systemd le definizioni delle unità. `enable` configura l'avvio automatico secondo la sezione `[Install]`; `--now` avvia subito il servizio. `status` fornisce lo stato corrente e una parte dei log recenti.
+
+Per leggere i log completi disponibili nel journal:
+
+```bash
+journalctl -u hello-service.service
+journalctl -u hello-service.service -f
+journalctl -u hello-service.service --since "30 minutes ago"
+```
+
+Il journal raccoglie l'output standard e lo standard error del servizio, salvo configurazioni differenti. Se il programma scrive i log soltanto in un file privato, occorre conoscere anche quel percorso. In produzione, i log dovrebbero avere un livello di dettaglio utile, non contenere segreti e avere una politica di conservazione appropriata.
+
+Quando si modifica la unit file, eseguire di nuovo `daemon-reload`; quando si cambia soltanto la configurazione letta dall'applicazione, potrebbe bastare un riavvio del servizio, a seconda di come il programma ricarica i dati.
+
+## 4. Restart policy: recupero, non soluzione magica
+
+Le opzioni di riavvio devono riflettere il comportamento del programma. `Restart=on-failure` è spesso una scelta ragionevole per servizi persistenti, mentre `Restart=always` può riavviare il processo anche dopo una terminazione volontaria, con eccezioni definite da systemd. `RestartSec` introduce un ritardo tra i tentativi.
+
+Un processo che termina immediatamente a causa di una configurazione errata può entrare in un ciclo di restart. systemd applica limiti ai tentativi secondo la configurazione di start rate limiting, ma l'operatore deve comunque leggere il journal e correggere la causa. Un riavvio continuo non è alta disponibilità: può nascondere il problema e consumare risorse.
+
+L'applicazione dovrebbe gestire SIGTERM e terminare in modo ordinato, chiudendo file e connessioni e completando o interrompendo il lavoro secondo una politica definita. Per molti servizi, systemd invia SIGTERM durante l'arresto e può poi ricorrere a un segnale più forte dopo il timeout. Un programma che ignora SIGTERM può rallentare shutdown e aggiornamenti.
+
+## 5. Hardening: ridurre i privilegi
+
+systemd include direttive che possono ridurre la superficie d'attacco. Un possibile punto di partenza, da testare con l'applicazione reale, è:
+
+```ini
+[Service]
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+```
+
+`NoNewPrivileges=true` impedisce al processo e ai suoi discendenti di acquisire nuovi privilegi tramite alcuni meccanismi di esecuzione. `PrivateTmp=true` offre una vista privata delle directory temporanee. `ProtectSystem=strict` rende la gerarchia del filesystem in sola lettura per il servizio, salvo eccezioni esplicite. `ProtectHome=true` limita l'accesso alle directory home. Le altre direttive restringono l'accesso a risorse del kernel o a funzionalità che l'applicazione potrebbe non richiedere.
+
+Queste opzioni non vanno incollate senza verifica. Un servizio che deve aggiornare dati in `/var/lib/hello-service` avrà bisogno di un percorso scrivibile esplicitamente concesso, per esempio attraverso `StateDirectory=hello-service` o altre direttive appropriate. Un servizio che deve gestire dispositivi, cambiare interfacce di rete o caricare moduli avrà requisiti diversi da un semplice processo web.
+
+Le direttive di hardening sono difesa in profondità, non una sostituzione per aggiornamenti, validazione degli input e permessi corretti. Dopo averle introdotte, verificare i log e provare tutti i percorsi funzionali dell'applicazione.
+
+## 6. Directory gestite da systemd
+
+Direttive come `StateDirectory=`, `CacheDirectory=`, `RuntimeDirectory=` e `LogsDirectory=` permettono di dichiarare i percorsi di cui il servizio ha bisogno. systemd può crearli e impostare proprietà coerenti con l'utente e il gruppo del servizio, secondo le regole della direttiva.
+
+Questa separazione è utile perché dati persistenti, cache e file temporanei hanno cicli di vita differenti. Un database applicativo non dovrebbe essere collocato in una directory runtime che può essere rimossa all'arresto. Una cache, invece, dovrebbe poter essere ricostruita. La scelta del percorso documenta anche il ruolo del dato per chi amministra il sistema.
+
+Per i segreti, non usare variabili d'ambiente o file con permessi troppo ampi senza valutare il modello di minaccia. systemd supporta diversi meccanismi per fornire credenziali e configurazioni, ma la scelta dipende dalla versione e dalla piattaforma.
+
+## 7. Dipendenze e disponibilità della rete
+
+`After=` stabilisce un ordine di avvio, non una dipendenza forte da solo. `Requires=` e `Wants=` esprimono relazioni di dipendenza, ma non risolvono i problemi di disponibilità di un servizio remoto. Anche se `network-online.target` viene raggiunto, un server DNS o un endpoint esterno può diventare indisponibile un istante dopo.
+
+Per le connessioni remote, il programma dovrebbe usare timeout finiti, retry con backoff e una strategia per recuperare da una connessione interrotta. Un servizio ben progettato non presuppone che la rete resti sempre disponibile soltanto perché systemd ha avviato il processo.
+
+## 8. Debugging quando il servizio non parte
+
+Un metodo pratico è partire dal messaggio di errore più vicino al processo:
+
+```bash
+systemctl status hello-service.service
+journalctl -u hello-service.service -b
+systemd-analyze verify /etc/systemd/system/hello-service.service
+```
+
+`systemd-analyze verify` può individuare errori nella definizione dell'unità, ma non garantisce che il programma funzioni. Se l'eseguibile non parte, controllare percorso, permessi, architettura, librerie dinamiche e directory di lavoro. Se parte e termina, verificare gli argomenti, la configurazione e il codice di uscita. Se fallisce soltanto dopo aver attivato le direttive di hardening, controllare quali file o risorse non riesce più ad accedere.
+
+Cambiare una direttiva per volta aiuta a individuare il vincolo che ha rotto il servizio. Evitare di rimuovere tutto l'hardening per sempre solo perché una prima configurazione era troppo restrittiva: è meglio concedere l'accesso minimo necessario.
+
+## Conclusione
+
+Un servizio systemd ben costruito non è soltanto una riga `ExecStart`. Ha un utente dedicato, una politica di riavvio ragionevole, log leggibili, un comportamento corretto durante SIGTERM e una separazione chiara tra eseguibili, configurazione, stato e cache.
+
+L'hardening funziona quando riflette le necessità reali del processo. Parti da una unit file semplice, verifica il comportamento e aggiungi restrizioni progressivamente. In questo modo, ogni direttiva diventa una decisione motivata e non un'opzione copiata senza comprenderne gli effetti.

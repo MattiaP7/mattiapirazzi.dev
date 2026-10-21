@@ -1,0 +1,228 @@
+---
+title: "Crea il tuo text editor in C++23: disegnare lo schermo"
+description: "Sequenze di escape VT100, buffer di output, dimensioni del terminale e la prima classe Editor con le tildi stile vim, divisa in header."
+date: "2026-10-21"
+author: "Mattia"
+tags: ["c++", "c++23", "vt100", "escape sequences", "text editor"]
+series: "crea-il-tuo-text-editor"
+order: 3
+---
+
+Abbiamo la raw mode. Adesso l'editor deve **disegnare** qualcosa. Il terminale non ha una API grafica: si comanda scrivendo sul suo output del testo speciale, le **sequenze di escape**.
+
+Struttura del progetto a fine parte:
+
+```text
+ted/
+├── Makefile
+└── src/
+    ├── main.cpp                ← ora definitivo
+    ├── terminal/
+    │   ├── raw_mode.hpp
+    │   ├── screen.hpp          ← nuovo
+    │   └── input.hpp           ← nuovo
+    └── editor/
+        └── editor.hpp          ← nuovo
+```
+
+## Sequenze di escape in due minuti
+
+Una sequenza di escape comincia con il byte 27 (`\x1b`) seguito da `[`, poi parametri e un comando di una lettera. Quelle che ci servono:
+
+- `\x1b[2J`: cancella tutto lo schermo.
+- `\x1b[H`: porta il cursore in alto a sinistra (riga 1, colonna 1).
+- `\x1b[K`: cancella dal cursore fino a fine riga.
+- `\x1b[RIGA;COLONNAH`: posiziona il cursore (le coordinate partono da 1).
+- `\x1b[?25l` e `\x1b[?25h`: nasconde e mostra il cursore.
+
+## Un solo write per frame
+
+Se facessimo una `write()` per ogni pezzetto, lo schermo potrebbe sfarfallare, perché il terminale potrebbe disegnare stati intermedi. La soluzione: accumulare tutto in una `std::string` e fare **una sola** `write()` per frame.
+
+## terminal/screen.hpp: la dimensione del terminale
+
+Per sapere quante righe e colonne abbiamo, chiediamo al kernel con `ioctl` e `TIOCGWINSZ`:
+
+```cpp
+#pragma once
+
+#include <optional>
+#include <utility>
+
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+namespace ted {
+
+// ritorna {righe, colonne}
+inline std::optional<std::pair<int, int>> window_size() {
+    winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0)
+        return std::nullopt;
+    return std::pair{static_cast<int>(ws.ws_row), static_cast<int>(ws.ws_col)};
+}
+
+}  // namespace ted
+```
+
+Le funzioni libere in un header devono essere `inline`, altrimenti includere il file da più punti darebbe errori del linker.
+
+## terminal/input.hpp: leggere un tasto
+
+Come abbiamo visto, Ctrl più una lettera equivale a mascherare il codice con `0x1f`. Una piccola funzione `constexpr` rende il codice leggibile. Poi una funzione che legge un tasto, lanciando un'eccezione in caso di errore (la raw mode verrà ripristinata dal distruttore mentre l'eccezione risale):
+
+```cpp
+#pragma once
+
+#include <cerrno>
+#include <system_error>
+
+#include <unistd.h>
+
+namespace ted {
+
+constexpr int ctrl(char c) { return c & 0x1f; }
+
+inline int read_key() {
+    char c;
+    for (;;) {
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n == 1) return static_cast<unsigned char>(c);
+        if (n == -1 && errno != EAGAIN)
+            throw std::system_error{errno, std::generic_category(), "read"};
+    }
+}
+
+}  // namespace ted
+```
+
+Con `VMIN = 0` e `VTIME = 1`, `read()` ritorna 0 quando scade il timeout: il ciclo semplicemente riprova.
+
+## editor/editor.hpp: la struct Editor
+
+Lo stato dell'editor sta in una struct e le operazioni sono metodi:
+
+```cpp
+#pragma once
+
+#include <algorithm>
+#include <cerrno>
+#include <format>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <tuple>
+
+#include <unistd.h>
+
+#include "terminal/input.hpp"
+#include "terminal/screen.hpp"
+
+namespace ted {
+
+constexpr auto version = "0.1";
+
+struct Editor {
+    int cx = 0, cy = 0;               // posizione del cursore
+    int screen_rows = 0, screen_cols = 0;
+    std::string out;                  // buffer di output del frame
+
+    Editor() {
+        auto size = window_size();
+        if (!size) 
+          throw std::runtime_error{"impossibile leggere la dimensione del terminale"};
+        std::tie(screen_rows, screen_cols) = *size;
+    }
+
+    void run() {
+        for (;;) {
+            refresh_screen();
+            if (!process_keypress()) break;
+        }
+        out = "\x1b[2J\x1b[H";        // lascia il terminale pulito
+        flush();
+    }
+
+    void flush() {
+        if (write(STDOUT_FILENO, out.data(), out.size()) == -1)
+            throw std::system_error{errno, std::generic_category(), "write"};
+        out.clear();
+    }
+
+    void draw_welcome() {
+        auto msg = std::format("ted -- text editor, versione {}", version);
+        if (static_cast<int>(msg.size()) > screen_cols) msg.resize(screen_cols);
+        int pad = (screen_cols - static_cast<int>(msg.size())) / 2;
+        if (pad > 0) { out += '~'; --pad; }
+        out.append(std::max(pad, 0), ' ');
+        out += msg;
+    }
+
+    void draw_rows() {
+        for (int y = 0; y < screen_rows; ++y) {
+            if (y == screen_rows / 3) draw_welcome();
+            else out += '~';
+            out += "\x1b[K";                        // cancella il resto della riga
+            if (y < screen_rows - 1) out += "\r\n";
+        }
+    }
+
+    void refresh_screen() {
+        out += "\x1b[?25l\x1b[H";                   // nascondi cursore, vai in alto
+        draw_rows();
+        out += std::format("\x1b[{};{}H", cy + 1, cx + 1);
+        out += "\x1b[?25h";                         // mostra cursore
+        flush();
+    }
+
+    bool process_keypress() {
+        switch (read_key()) {
+        case ctrl('q'): return false;
+        }
+        return true;
+    }
+};
+
+}  // namespace ted
+```
+
+Note:
+
+- Invece di cancellare tutto lo schermo a ogni frame (sfarfallio), **riscriviamo ogni riga** e usiamo `\x1b[K` per ripulire solo il resto di quella riga.
+- Nascondiamo il cursore durante il disegno, così non lo si vede saltare in giro.
+- `std::format` ci evita le `snprintf` del C per costruire le sequenze.
+- Non mettiamo `\r\n` dopo l'ultima riga, altrimenti lo schermo scrollerebbe.
+
+## main.cpp: ora definitivo
+
+Con tutta la logica negli header, `main.cpp` si riduce a collegare i pezzi. Questa è la forma che manterrà quasi fino alla fine:
+
+```cpp
+#include <cstdio>
+#include <exception>
+#include <print>
+#include <system_error>
+
+#include "editor/editor.hpp"
+#include "terminal/raw_mode.hpp"
+
+int main() {
+    try {
+        auto raw = ted::RawMode::enable();
+        if (!raw) throw std::system_error{raw.error(), "tcsetattr"};
+
+        ted::Editor editor;
+        editor.run();
+    } catch (const std::exception& e) {
+        std::print(stderr, "\x1b[2J\x1b[H");        // pulisce lo schermo
+        std::println(stderr, "errore: {}", e.what());
+        return 1;
+    }
+}
+```
+
+`raw` è dichiarato **dentro** il blocco `try`: quando un'eccezione esce, il distruttore ripristina il terminale **prima** che il blocco `catch` stampi l'errore. Così il messaggio compare in un terminale tornato normale.
+
+Esegui `make && ./ted`: vedrai una colonna di tilde a sinistra e il messaggio di benvenuto a un terzo dell'altezza. Ridimensiona la finestra e rilancia per vedere che si adatta. Esci con **Ctrl-Q**.
+
+Nella prossima parte facciamo muovere il cursore.

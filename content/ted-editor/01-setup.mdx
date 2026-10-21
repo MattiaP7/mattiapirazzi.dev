@@ -1,0 +1,153 @@
+---
+title: "Crea il tuo text editor in C++23: setup e struttura del progetto"
+description: "Prima parte della serie: costruiamo da zero un editor di testo da terminale in C++23, senza librerie esterne. Struttura a cartelle con header, Makefile e un main.cpp pulito."
+date: "2026-10-21"
+author: "Mattia"
+tags: ["c++", "c++23", "terminale", "text editor", "tutorial"]
+series: "crea-il-tuo-text-editor"
+order: 1
+---
+
+In questa serie costruiremo **ted**, un editor di testo da terminale scritto in C++23 moderno, in circa 700 righe e **senza nessuna libreria esterna**: solo la libreria standard e le API POSIX. L'idea è ispirata allo splendido tutorial [Build Your Own Text Editor](https://viewsourcecode.org/snaptoken/kilo/), che guida a riscrivere `kilo` in C. Qui faremo lo stesso percorso, ma usando gli strumenti del C++ moderno: RAII, `std::expected`, `std::format`, `std::print`, `std::string_view` e così via.
+
+A differenza dell'originale, che è un unico file, qui il progetto è **organizzato in cartelle e header**, con un `main.cpp` minuscolo e un `Makefile`. Seguire un tutorial è molto più facile quando ogni pezzo di codice ha una casa precisa.
+
+## Cosa costruiremo
+
+Alla fine avremo un editor che:
+
+- apre e salva file di testo;
+- mostra barra di stato e barra dei messaggi;
+- gestisce scrolling, tab e cursore con le frecce;
+- permette di inserire e cancellare testo;
+- ha la ricerca incrementale;
+- colora la sintassi del C++.
+
+## Il percorso
+
+1. **Setup e struttura** (questa parte)
+2. Raw mode e RAII
+3. Disegnare lo schermo
+4. Input da tastiera e movimento del cursore
+5. Visualizzare un file e fare scrolling
+6. Modificare e salvare
+7. Ricerca incrementale
+8. Syntax highlighting
+
+Ogni parte aggiunge qualcosa alla precedente: se la segui in ordine, avrai sempre un programma che compila e funziona. All'inizio di ogni parte trovi l'**albero del progetto** aggiornato, e ogni blocco di codice dice **in quale file** va messo.
+
+## Requisiti
+
+- Linux o macOS (useremo `termios`, `ioctl` e sequenze di escape VT100). Su Windows va bene WSL.
+- Un compilatore con buon supporto a C++23: **GCC 14 o superiore** oppure Clang recente con una libreria standard aggiornata. Ci servono `std::print`, `std::expected` e `std::string_view::contains`.
+- `make`.
+
+```bash
+g++ --version
+make --version
+```
+
+## Struttura del progetto
+
+Alla fine della serie avremo questo:
+
+```text
+ted/
+├── Makefile
+└── src/
+    ├── main.cpp
+    ├── terminal/
+    │   ├── raw_mode.hpp     # RAII per la raw mode (parte 2)
+    │   ├── screen.hpp       # dimensione del terminale (parte 3)
+    │   └── input.hpp        # tasti e lettura input (parti 3-4)
+    └── editor/
+        ├── editor.hpp       # la classe Editor (parti 3-8)
+        ├── row.hpp          # una riga di testo e il suo render (parti 5-8)
+        ├── highlight.hpp    # categorie, colori, linguaggi (parte 8)
+        └── syntax.hpp       # lo scanner di sintassi (parte 8)
+```
+
+La divisione ha un criterio: in `terminal/` c'è tutto ciò che parla col **terminale** (non sa nulla di editor), in `editor/` c'è la **logica** dell'editor. `main.cpp` deve limitarsi a collegare i pezzi.
+
+Una scelta di semplicità: i nostri header sono **header-only**. Le funzioni libere sono `inline` e i metodi sono definiti dentro la classe, così non servono file `.cpp` separati e il linker non ci dà problemi. Per un progetto di questa dimensione si compila in un attimo. Alla fine della serie vedremo come spostare l'implementazione in `.cpp` se vuoi.
+
+Crea le cartelle:
+
+```bash
+mkdir -p ted/src/terminal ted/src/editor
+cd ted
+```
+
+## Il Makefile
+
+Crea `Makefile` nella radice del progetto:
+
+```make
+CXX      ?= g++
+CPPFLAGS := -Isrc
+CXXFLAGS ?= -std=c++23 -Wall -Wextra -Wpedantic -O2
+
+TARGET := ted
+SRCS   := $(shell find src -name '*.cpp')
+HDRS   := $(shell find src -name '*.hpp')
+
+$(TARGET): $(SRCS) $(HDRS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(SRCS) -o $@
+
+run: $(TARGET)
+	./$(TARGET) $(FILE)
+
+clean:
+	rm -f $(TARGET)
+
+.PHONY: run clean
+```
+
+Attenzione: le righe dei comandi (quelle sotto `$(TARGET):`, `run:` e `clean:`) devono iniziare con un **carattere tab**, non con spazi, altrimenti `make` si lamenta con "missing separator".
+
+Cosa fa:
+
+- `-Isrc` aggiunge `src/` ai percorsi di ricerca, così negli `#include` scriveremo `"terminal/raw_mode.hpp"` invece di percorsi relativi con `../`.
+- `find` raccoglie da solo tutti i `.cpp` e gli `.hpp`: aggiungere un file non richiede di toccare il Makefile.
+- Gli header sono dipendenze del target, quindi **modificare un `.hpp` fa ricompilare**.
+- I warning (`-Wall -Wextra -Wpedantic`) sono sempre accesi: ci aiutano a non farci male.
+
+Si usa così:
+
+```bash
+make                       # compila
+make run FILE=src/main.cpp # compila e apre un file con ted
+make clean                 # cancella l'eseguibile
+make CXX=g++-14            # scegliere un compilatore diverso
+```
+
+## Il programma più piccolo possibile
+
+Crea `src/main.cpp`:
+
+```cpp
+#include <unistd.h>
+
+int main() {
+    char c;
+    while (read(STDIN_FILENO, &c, 1) == 1 && c != 'q');
+    return 0;
+}
+```
+
+`read()` legge byte da un file descriptor. `STDIN_FILENO` è l'input standard, cioè la tastiera. Il ciclo legge **un byte alla volta** e si ferma quando riceve `q` oppure quando `read` ritorna 0 o -1.
+
+```bash
+make
+./ted
+```
+
+Prova a scrivere qualche lettera: non succede nulla finché non premi **Invio**. Poi scrivi `q` e Invio: il programma termina. Se scrivi `abcq`, il ciclo consuma `a`, `b`, `c` e si ferma alla `q`; il resto resta nel buffer del terminale e finisce alla tua shell.
+
+Prova anche **Ctrl-C** (termina il programma) e **Ctrl-Z** (lo sospende). In un editor vorremo questi tasti sotto il nostro controllo.
+
+## Perché non funziona come un editor?
+
+Per default il terminale è in **modalità canonica** (o *cooked mode*): raccoglie quello che scrivi in una riga, ti lascia correggere con backspace, fa l'eco dei caratteri e consegna il testo al programma solo quando premi Invio. È perfetto per una shell, ma un editor deve reagire a **ogni singolo tasto**, subito, e decidere da solo cosa disegnare.
+
+Serve la **raw mode**: spegnere tutte queste comodità. È l'argomento della prossima parte, dove useremo una classe RAII in `terminal/raw_mode.hpp` per essere sicuri di ripristinare il terminale all'uscita, anche in caso di errore.

@@ -1,0 +1,297 @@
+---
+title: "Crea il tuo text editor in C++23: modificare e salvare"
+description: "Inserimento e cancellazione di caratteri, ritorno a capo, salvataggio su disco, barra dei messaggi, flag di modifica e prompt di input in editor.hpp."
+date: "2026-10-21"
+author: "Mattia"
+tags: ["c++", "c++23", "editing", "file io", "text editor"]
+series: "crea-il-tuo-text-editor"
+order: 6
+---
+
+Il momento che stavamo aspettando: far **scrivere** l'editor. Vediamo le operazioni sulle righe, poi il salvataggio.
+
+In questa parte il lavoro è tutto in `src/editor/editor.hpp`. Nessun file nuovo, nessuna modifica a `main.cpp`.
+
+## Barra dei messaggi
+
+Ci serve un posto dove dare feedback all'utente ("salvato", "attenzione"...). Riserviamo una seconda riga in fondo allo schermo, che mostra un messaggio per 5 secondi. Aggiungi gli include `<chrono>`, `<functional>`, `<optional>`, `<string_view>` e `<utility>`, e dopo gli include:
+
+```cpp
+using namespace std::chrono_literals;
+```
+
+Nuovi membri di `Editor`:
+
+```cpp
+std::string status_msg;
+std::chrono::steady_clock::time_point status_time;
+bool dirty = false;               // modifiche non salvate
+int quit_times = 3;
+```
+
+Nel costruttore passiamo da 1 a 2 righe riservate e mostriamo un aiuto iniziale:
+
+```cpp
+screen_rows -= 2;
+set_status("Ctrl-S = salva | Ctrl-Q = esci");
+```
+
+`set_status` usa `std::format_string`, quindi **la stringa di formato è controllata a tempo di compilazione**: se sbagli un `{}` hai un errore di compilazione, non un crash a runtime.
+
+```cpp
+template <typename... Args>
+void set_status(std::format_string<Args...> fmt, Args&&... args) {
+    status_msg = std::format(fmt, std::forward<Args>(args)...);
+    status_time = std::chrono::steady_clock::now();
+}
+
+void draw_message_bar() {
+    out += "\x1b[K";
+    auto len = std::min(status_msg.size(), static_cast<size_t>(screen_cols));
+    if (len > 0 && std::chrono::steady_clock::now() - status_time < 5s)
+        out.append(status_msg, 0, len);
+}
+```
+
+In `draw_status_bar()` aggiungiamo l'indicatore di modifica e un `\r\n` finale, e in `refresh_screen()` chiamiamo `draw_message_bar()` dopo la barra di stato:
+
+```cpp
+auto left = std::format("{:.20} - {} righe {}",
+                        filename.empty() ? "[senza nome]" : filename,
+                        rows.size(),
+                        dirty ? "(modificato)" : "");
+// ... resto invariato ...
+out += "\x1b[m\r\n";
+```
+
+```cpp
+draw_rows();
+draw_status_bar();
+draw_message_bar();
+```
+
+## Operazioni sulle righe
+
+Sostituiamo `append_row` con una più generale `insert_row(at, ...)`, che serve per il ritorno a capo, e aggiungiamo le altre operazioni. Ogni modifica imposta `dirty = true`:
+
+```cpp
+void insert_row(int at, std::string s) {
+    if (at < 0 || at > static_cast<int>(rows.size())) return;
+    Row r;
+    r.chars = std::move(s);
+    update_row(r);
+    rows.insert(rows.begin() + at, std::move(r));
+    dirty = true;
+}
+
+void row_insert_char(Row& r, int at, char c) {
+    at = std::clamp(at, 0, static_cast<int>(r.chars.size()));
+    r.chars.insert(r.chars.begin() + at, c);
+    update_row(r);
+    dirty = true;
+}
+```
+
+In `open()` sostituiamo `append_row(line)` con `insert_row(rows.size(), line)` e, alla fine, rimettiamo `dirty = false`: aprire un file non è una modifica.
+
+## Operazioni sull'editor
+
+```cpp
+void insert_char(char c) {
+    if (cy == static_cast<int>(rows.size())) insert_row(rows.size(), "");
+    row_insert_char(rows[cy], cx, c);
+    ++cx;
+}
+
+void insert_newline() {
+    if (cx == 0) {
+        insert_row(cy, "");
+    } else {
+        auto& r = rows[cy];
+        std::string tail = r.chars.substr(cx);
+        r.chars.resize(cx);
+        update_row(r);
+        insert_row(cy + 1, std::move(tail));   // attenzione: invalida r
+    }
+    ++cy;
+    cx = 0;
+}
+
+void del_char() {
+    if (cy == static_cast<int>(rows.size())) return;
+    if (cx == 0 && cy == 0) return;
+
+    if (cx > 0) {
+        rows[cy].chars.erase(cx - 1, 1);
+        update_row(rows[cy]);
+        --cx;
+    } else {
+        // inizio riga: unisci la riga corrente alla precedente
+        cx = static_cast<int>(rows[cy - 1].chars.size());
+        rows[cy - 1].chars += rows[cy].chars;
+        update_row(rows[cy - 1]);
+        rows.erase(rows.begin() + cy);
+        --cy;
+    }
+    dirty = true;
+}
+```
+
+Un dettaglio che in C++ morde: `insert_row` fa un `rows.insert(...)`, che può **riallocare il vettore e invalidare i riferimenti** alle righe. Per questo in `insert_newline` ho finito di usare `r` prima di chiamarla.
+
+## Salvare
+
+Prima trasformiamo le righe in un'unica stringa:
+
+```cpp
+std::string rows_to_string() const {
+    std::string s;
+    for (const auto& r : rows) {
+        s += r.chars;
+        s += '\n';
+    }
+    return s;
+}
+```
+
+Poi il salvataggio vero e proprio. Se il file non ha ancora un nome, lo chiediamo con un prompt:
+
+```cpp
+void save() {
+    if (filename.empty()) {
+        auto name = prompt("Salva come: ");
+        if (!name) {
+            set_status("Salvataggio annullato");
+            return;
+        }
+        filename = *name;
+    }
+
+    auto data = rows_to_string();
+    std::ofstream f{filename, std::ios::binary | std::ios::trunc};
+    if (f) f.write(data.data(), static_cast<std::streamsize>(data.size()));
+    if (!f) {
+        set_status("Errore di salvataggio su '{}'", filename);
+        return;
+    }
+    dirty = false;
+    set_status("{} byte scritti su disco", data.size());
+}
+```
+
+## Il prompt
+
+Il prompt mostra un'etichetta nella barra dei messaggi, raccoglie caratteri in un buffer e ritorna `std::optional<std::string>`: `nullopt` se l'utente preme Esc, il testo se preme Invio. Ha anche un **callback** opzionale, chiamato a ogni tasto: nella parte 7 lo useremo per la ricerca incrementale.
+
+```cpp
+std::optional<std::string> prompt(
+        std::string_view label,
+        std::function<void(const std::string&, int)> cb = {}) {
+    std::string buf;
+    for (;;) {
+        set_status("{}{}", label, buf);
+        refresh_screen();
+
+        int c = read_key();
+        if (c == Del || c == ctrl('h') || c == Backspace) {
+            if (!buf.empty()) buf.pop_back();
+        } else if (c == '\x1b') {
+            set_status("");
+            if (cb) cb(buf, c);
+            return std::nullopt;
+        } else if (c == '\r') {
+            if (!buf.empty()) {
+                set_status("");
+                if (cb) cb(buf, c);
+                return buf;
+            }
+        } else if (c >= 32 && c < 127) {
+            buf += static_cast<char>(c);
+        }
+        if (cb) cb(buf, c);
+    }
+}
+```
+
+## Collegare i tasti
+
+Il nuovo `process_keypress()` completo. Aggiungiamo anche la **protezione contro l'uscita accidentale**: se ci sono modifiche non salvate, Ctrl-Q va premuto 3 volte.
+
+```cpp
+bool process_keypress() {
+    int c = read_key();
+    switch (c) {
+    case '\r':
+        insert_newline();
+        break;
+
+    case ctrl('q'):
+        if (dirty && quit_times > 0) {
+            set_status("ATTENZIONE: modifiche non salvate. "
+                       "Premi Ctrl-Q ancora {} volte per uscire.", quit_times);
+            --quit_times;
+            return true;
+        }
+        return false;
+
+    case ctrl('s'):
+        save();
+        break;
+
+    case Home: cx = 0; break;
+    case End:
+        if (cy < static_cast<int>(rows.size()))
+            cx = static_cast<int>(rows[cy].chars.size());
+        break;
+
+    case Backspace:
+    case ctrl('h'):
+    case Del:
+        if (c == Del) move_cursor(ArrowRight);
+        del_char();
+        break;
+
+    case PageUp:
+    case PageDown:
+        if (c == PageUp) cy = row_off;
+        else cy = std::min(row_off + screen_rows - 1, static_cast<int>(rows.size()));
+        for (int n = screen_rows; n > 0; --n)
+            move_cursor(c == PageUp ? ArrowUp : ArrowDown);
+        break;
+
+    case ArrowLeft:
+    case ArrowRight:
+    case ArrowUp:
+    case ArrowDown:
+        move_cursor(c);
+        break;
+
+    case ctrl('l'):
+    case '\x1b':
+        break;
+
+    default:
+        if (c == '\t' || (c >= 32 && c < 127))
+            insert_char(static_cast<char>(c));
+        break;
+    }
+    quit_times = 3;
+    return true;
+}
+```
+
+Il tasto Del è implementato come "freccia destra + backspace": spostiamo il cursore avanti di uno e cancelliamo all'indietro.
+
+## Limiti attuali
+
+Per ora accettiamo solo caratteri ASCII stampabili e tab. Sul testo UTF-8 il cursore si muoverebbe **byte per byte**, il che con le lettere accentate dà risultati strani: gestirlo bene richiede di ragionare in code point o grapheme cluster, ed è un ottimo esercizio per dopo.
+
+## Provalo
+
+```bash
+make run FILE=prova.txt
+```
+
+Scrivi, cancella, vai a capo, salva con **Ctrl-S**. Esci con Ctrl-Q: se hai modifiche non salvate l'editor ti avvisa. Prova anche senza argomento (`make run`): Ctrl-S ti chiede il nome del file.
+
+Nella prossima parte aggiungiamo la ricerca.

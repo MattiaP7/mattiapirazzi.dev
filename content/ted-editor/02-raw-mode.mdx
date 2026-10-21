@@ -1,0 +1,161 @@
+---
+title: "Crea il tuo text editor in C++23: raw mode con RAII"
+description: "Disattiviamo l'eco e la modalità canonica del terminale usando termios, incapsulando tutto in una classe RAII in terminal/raw_mode.hpp."
+date: "2026-10-21"
+author: "Mattia"
+tags: ["c++", "c++23", "termios", "raii", "text editor"]
+series: "crea-il-tuo-text-editor"
+order: 2
+---
+
+Nella parte precedente abbiamo visto che il terminale, per default, lavora in modalità canonica. Ora lo mettiamo in **raw mode**.
+
+Struttura del progetto a fine parte:
+
+```text
+ted/
+├── Makefile
+└── src/
+    ├── main.cpp
+    └── terminal/
+        └── raw_mode.hpp     ← nuovo
+```
+
+## Gli attributi del terminale: termios
+
+Su POSIX gli attributi di un terminale si leggono con `tcgetattr()` e si scrivono con `tcsetattr()`, usando la struct `termios`. Il flusso è sempre lo stesso:
+
+1. leggi gli attributi originali e **salvali**;
+2. copia la struct e modifica i flag;
+3. applica la copia modificata;
+4. all'uscita, **ripristina gli originali**.
+
+Il punto 4 è cruciale: se il programma termina senza ripristinare, la tua shell resta in raw mode, senza eco, e devi chiudere il terminale. In C si usa `atexit()`. In C++ abbiamo uno strumento molto migliore: **RAII**.
+
+## Una classe RAII per la raw mode
+
+Crea `src/terminal/raw_mode.hpp`:
+
+```cpp
+#pragma once
+
+#include <cerrno>
+#include <expected>
+#include <system_error>
+#include <utility>
+
+#include <termios.h>
+#include <unistd.h>
+
+namespace ted {
+
+class RawMode {
+public:
+    static std::expected<RawMode, std::error_code> enable() {
+        termios orig{};
+        if (tcgetattr(STDIN_FILENO, &orig) == -1)
+            return std::unexpected{std::error_code{errno, std::generic_category()}};
+
+        termios raw = orig;
+        raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+        raw.c_oflag &= ~(OPOST);
+        raw.c_cflag |= CS8;
+        raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+        raw.c_cc[VMIN] = 0;   // read() ritorna appena c'è qualcosa...
+        raw.c_cc[VTIME] = 1;  // ...oppure dopo 100 ms
+
+        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
+            return std::unexpected{std::error_code{errno, std::generic_category()}};
+
+        return RawMode{orig};
+    }
+
+    RawMode(RawMode&& other) noexcept
+        : orig_{other.orig_}, active_{std::exchange(other.active_, false)} {}
+    RawMode& operator=(RawMode&&) = delete;
+    RawMode(const RawMode&) = delete;
+    RawMode& operator=(const RawMode&) = delete;
+
+    ~RawMode() {
+        if (active_) tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_);
+    }
+
+private:
+    explicit RawMode(const termios& orig) : orig_{orig}, active_{true} {}
+
+    termios orig_;
+    bool active_;
+};
+
+}  // namespace ted
+```
+
+Tutto il codice del progetto vive nel namespace `ted`. Alcune scelte di design:
+
+- **`std::expected`** al posto di eccezioni o codici di ritorno: `enable()` o ti restituisce un `RawMode` valido, o un `std::error_code`. Non esiste uno stato "mezzo costruito".
+- Il **costruttore è privato**: l'unico modo per ottenere un `RawMode` è `enable()`, quindi se ce l'hai, la raw mode è davvero attiva.
+- Il **move constructor** trasferisce la responsabilità del ripristino: l'oggetto "svuotato" ha `active_ == false` e il suo distruttore non fa nulla. Copia e assegnazione sono vietate perché ripristinare due volte non avrebbe senso.
+
+## Cosa fa ogni flag
+
+- `ECHO`: il terminale non stampa più quello che digiti.
+- `ICANON`: legge **byte per byte** invece che riga per riga.
+- `ISIG`: Ctrl-C e Ctrl-Z non generano più segnali (`SIGINT`, `SIGTSTP`).
+- `IXON`: Ctrl-S e Ctrl-Q non fermano/riprendono più l'output. Ci servono liberi per salvare e uscire.
+- `IEXTEN`: disattiva Ctrl-V (e Ctrl-O su macOS).
+- `ICRNL`: il terminale non converte più `\r` (Invio) in `\n`. Così Invio e Ctrl-J sono distinguibili.
+- `OPOST`: il terminale non traduce più `\n` in `\r\n` in output. D'ora in poi **dobbiamo scrivere `\r\n` a mano**.
+- `BRKINT`, `INPCK`, `ISTRIP`, `CS8`: flag storici della raw mode "classica"; su un terminale moderno spesso non cambiano nulla, ma è buona prassi.
+
+`VMIN` e `VTIME` sono nel campo `c_cc`: con `VMIN = 0` e `VTIME = 1`, `read()` ritorna dopo al massimo un decimo di secondo anche se non è arrivato nulla. Ci tornerà utile per distinguere il tasto **Esc** dalle sequenze di escape delle frecce.
+
+## Usarla da main.cpp
+
+Sostituisci il contenuto di `src/main.cpp` con questo programma di prova:
+
+```cpp
+#include <cctype>
+#include <cerrno>
+#include <print>
+
+#include <unistd.h>
+
+#include "terminal/raw_mode.hpp"
+
+int main() {
+    auto raw = ted::RawMode::enable();
+    if (!raw) {
+        std::println(stderr, "errore: {}", raw.error().message());
+        return 1;
+    }
+
+    for (;;) {
+        char c = '\0';
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n == -1 && errno != EAGAIN) {
+            std::println(stderr, "errore di lettura");
+            return 1;
+        }
+        if (std::iscntrl(static_cast<unsigned char>(c)))
+            std::print("{}\r\n", static_cast<int>(c));
+        else
+            std::print("{} ('{}')\r\n", static_cast<int>(c), c);
+        if (c == 'q') break;
+    }
+}
+```
+
+Nota che **qualsiasi** uscita da `main` (anche il `return 1`) distrugge `raw`, quindi il terminale torna normale. Con `atexit` o con un `exit()` sparso nel codice non avresti questa garanzia.
+
+## Esperimenti
+
+Esegui `make && ./ted`. Ora ogni tasto stampa subito il suo codice:
+
+- Le lettere stampano il codice ASCII (`a` è 97).
+- **Ctrl-A** stampa `1`, **Ctrl-B** stampa `2`, e così via: Ctrl più una lettera azzera i bit alti del carattere. Ci servirà tra poco.
+- **Invio** stampa `13`, **Backspace** `127`, **Esc** `27`.
+- Le **frecce** stampano tre byte: `27`, `91`, e una lettera (`65` su, `66` giù, `67` destra, `68` sinistra). Sono *sequenze di escape*: le gestiremo nella parte 4.
+- Ctrl-C, Ctrl-Z, Ctrl-S, Ctrl-Q, Ctrl-V non fanno più nulla di speciale.
+- Ogni tanto compare uno `0`: è il timeout di `read()`, nessun tasto premuto.
+
+Esci con `q`. Nella prossima parte disegniamo lo schermo.

@@ -1,0 +1,141 @@
+---
+title: "Crea il tuo text editor in C++23: ricerca incrementale"
+description: "Implementiamo la ricerca incrementale con Ctrl-F, riusando il prompt con callback: ricerca mentre scrivi, frecce per navigare i risultati, Esc per tornare indietro."
+date: "2026-10-21"
+author: "Mattia"
+tags: ["c++", "c++23", "ricerca", "callback", "text editor"]
+series: "crea-il-tuo-text-editor"
+order: 7
+---
+
+Un editor senza ricerca è scomodo. Grazie al prompt con callback della parte 6, la **ricerca incrementale** (quella che salta alla prima occorrenza *mentre scrivi*) è sorprendentemente piccola.
+
+File toccati in questa parte: `src/editor/row.hpp` (una funzione di conversione) ed `src/editor/editor.hpp` (la ricerca vera e propria).
+
+## L'idea
+
+Il prompt chiama il callback dopo ogni tasto, passando il testo corrente e il tasto premuto. Il callback:
+
+1. cerca la prima riga che contiene la query, partendo dall'ultima occorrenza trovata;
+2. sposta il cursore lì;
+3. con le frecce, cambia direzione e passa all'occorrenza successiva o precedente;
+4. con Invio o Esc, resetta lo stato di ricerca.
+
+Se l'utente preme **Esc**, l'editor deve tornare alla posizione che aveva prima della ricerca.
+
+## row.hpp: conversione render → chars
+
+La ricerca avviene sul testo disegnato (`render`), perché è quello che l'utente vede. Ma il cursore vive in `chars`, quindi ci serve la conversione inversa rispetto a `cx_to_rx`. Aggiungila in `row.hpp`, accanto a quella già presente:
+
+```cpp
+inline int rx_to_cx(const Row& r, int rx) {
+    int cur_rx = 0;
+    int cx = 0;
+    for (; cx < static_cast<int>(r.chars.size()); ++cx) {
+        if (r.chars[cx] == '\t') cur_rx += (tab_stop - 1) - (cur_rx % tab_stop);
+        ++cur_rx;
+        if (cur_rx > rx) return cx;
+    }
+    return cx;
+}
+```
+
+## editor.hpp: il callback
+
+Aggiungiamo due membri per ricordare lo stato tra una chiamata e l'altra:
+
+```cpp
+int find_last_match = -1;   // indice dell'ultima riga trovata
+int find_direction = 1;     // 1 = avanti, -1 = indietro
+```
+
+```cpp
+void find_callback(const std::string& query, int key) {
+    if (key == '\r' || key == '\x1b') {
+        find_last_match = -1;
+        find_direction = 1;
+        return;
+    } else if (key == ArrowRight || key == ArrowDown) {
+        find_direction = 1;
+    } else if (key == ArrowLeft || key == ArrowUp) {
+        find_direction = -1;
+    } else {
+        find_last_match = -1;
+        find_direction = 1;
+    }
+
+    if (find_last_match == -1) find_direction = 1;
+    int current = find_last_match;
+    const int n = static_cast<int>(rows.size());
+
+    for (int i = 0; i < n; ++i) {
+        current += find_direction;
+        if (current == -1) current = n - 1;
+        else if (current == n) current = 0;
+
+        auto pos = rows[current].render.find(query);
+        if (pos != std::string::npos) {
+            find_last_match = current;
+            cy = current;
+            cx = rx_to_cx(rows[current], static_cast<int>(pos));
+            // forza scroll(): la riga trovata finisce in cima allo schermo
+            row_off = n;     
+            break;
+        }
+    }
+}
+```
+
+Due trucchi da notare:
+
+- La ricerca scorre **circolarmente**: usciti dall'ultima riga si riparte dalla prima, e viceversa.
+- `row_off = n` sembra strano, ma è voluto: `scroll()` vede che `cy < row_off` e imposta `row_off = cy`, quindi la riga trovata compare **in cima** alla finestra. Non dobbiamo scrivere altro codice per centrare il risultato.
+
+## La funzione find()
+
+```cpp
+void find() {
+    int saved_cx = cx, saved_cy = cy;
+    int saved_col_off = col_off, saved_row_off = row_off;
+
+    auto query = prompt("Cerca (Esc/frecce/Invio): ",
+                        [this](const std::string& q, int key) { 
+                          find_callback(q, key); 
+                        });
+
+    if (!query) {                 // Esc: torna dov'eri
+        cx = saved_cx;
+        cy = saved_cy;
+        col_off = saved_col_off;
+        row_off = saved_row_off;
+    }
+}
+```
+
+Il lambda cattura `this` per poter chiamare un metodo dell'`Editor` dentro un `std::function`: il prompt non sa nulla della ricerca, e questo disaccoppiamento è proprio il motivo per cui abbiamo previsto il callback.
+
+Se invece l'utente preme **Invio**, il cursore resta sull'ultima occorrenza trovata, che è il comportamento voluto.
+
+## Collegare il tasto
+
+In `process_keypress()`, accanto a Ctrl-S:
+
+```cpp
+case ctrl('f'):
+    find();
+    break;
+```
+
+E aggiorniamo il messaggio iniziale nel costruttore:
+
+```cpp
+set_status("Ctrl-S = salva | Ctrl-F = cerca | Ctrl-Q = esci");
+```
+
+## Provalo
+
+`make run FILE=src/editor/editor.hpp`, poi **Ctrl-F** e comincia a scrivere: il cursore salta alla prima occorrenza, aggiornandosi a ogni lettera. Freccia giù/destra per la successiva, su/sinistra per la precedente. Esc annulla e ti riporta dov'eri, Invio ti lascia sulla corrispondenza.
+
+Un limite: la ricerca è sensibile alle maiuscole. Come esercizio puoi aggiungere un confronto case-insensitive, magari con `std::ranges::search` e un predicato su `std::tolower`.
+
+Nell'ultima parte rendiamo l'editor più bello: **syntax highlighting**.

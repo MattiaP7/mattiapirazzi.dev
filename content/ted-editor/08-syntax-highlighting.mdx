@@ -1,0 +1,307 @@
+---
+title: "Crea il tuo text editor in C++23: syntax highlighting"
+description: "Ultima parte: highlight.hpp e syntax.hpp per colorare commenti, stringhe, numeri e parole chiave del C++, evidenziamo la ricerca e vediamo dove andare dopo."
+date: "2026-10-21"
+author: "Mattia"
+tags: ["c++", "c++23", "syntax highlighting", "colori ANSI", "text editor"]
+series: "crea-il-tuo-text-editor"
+order: 8
+---
+
+Ultima parte: aggiungiamo i colori. Il syntax highlighting di un editor semplice è, in fondo, un piccolo scanner a stati che assegna a ogni carattere una **categoria**.
+
+Struttura finale del progetto:
+
+```text
+ted/
+├── Makefile
+└── src/
+    ├── main.cpp
+    ├── terminal/
+    │   ├── raw_mode.hpp
+    │   ├── screen.hpp
+    │   └── input.hpp
+    └── editor/
+        ├── editor.hpp          ← modificato
+        ├── row.hpp             ← modificato
+        ├── highlight.hpp       ← nuovo
+        └── syntax.hpp          ← nuovo
+```
+
+Le dipendenze tra gli header vanno in una sola direzione, senza cicli: `highlight.hpp` non dipende da nulla, `row.hpp` include `highlight.hpp`, `syntax.hpp` include `row.hpp` e `highlight.hpp`, ed `editor.hpp` include tutti.
+
+## editor/highlight.hpp: categorie, colori, linguaggi
+
+Per ogni carattere di `render` memorizzeremo un valore di una enum class. Crea `src/editor/highlight.hpp`:
+
+```cpp
+#pragma once
+
+#include <cctype>
+#include <cstdint>
+#include <string_view>
+#include <vector>
+
+namespace ted {
+
+enum class Hl : std::uint8_t {
+    Normal,
+    Comment,
+    Keyword1,   // controllo di flusso
+    Keyword2,   // tipi
+    String,
+    Number,
+    Match,      // risultato di ricerca
+};
+
+constexpr int hl_color(Hl h) {
+    switch (h) {
+    case Hl::Comment:  return 36;   // ciano
+    case Hl::Keyword1: return 33;   // giallo
+    case Hl::Keyword2: return 32;   // verde
+    case Hl::String:   return 35;   // magenta
+    case Hl::Number:   return 31;   // rosso
+    case Hl::Match:    return 34;   // blu
+    default:           return 39;   // colore predefinito
+    }
+}
+
+// descrizione di un linguaggio: estensioni e parole chiave
+struct Syntax {
+    std::string_view name;
+    std::vector<std::string_view> extensions;
+    std::vector<std::string_view> keywords1;
+    std::vector<std::string_view> keywords2;
+};
+
+inline const Syntax cpp_syntax{
+    "C++",
+    {".c", ".h", ".cc", ".cpp", ".hpp"},
+    {"if", "else", "for", "while", "do", "switch", "case", "break", "continue",
+     "return", "struct", "class", "enum", "namespace", "using", "template",
+     "typedef", "static", "const", "constexpr", "auto", "new", "delete",
+     "try", "catch", "throw", "public", "private", "protected", "virtual",
+     "override", "noexcept", "default", "inline", "typename", "nullptr"},
+    {"int", "long", "short", "double", "float", "char", "unsigned", "signed",
+     "void", "bool", "size_t", "string", "vector", "true", "false"},
+};
+
+inline bool is_separator(char c) {
+    return std::isspace(static_cast<unsigned char>(c)) || c == '\0'
+        || std::string_view{",.()+-/*=~%<>[];{}:"}.contains(c);
+}
+
+}  // namespace ted
+```
+
+Le sequenze `\x1b[31m`...`\x1b[37m` impostano il colore del testo, `\x1b[39m` ripristina quello predefinito. Aggiungere un altro linguaggio significa solo definire un'altra istanza di `Syntax`. `std::string_view::contains` è una novità del C++23 e rende `is_separator` una riga sola: nel C si usava `strchr`.
+
+## row.hpp: un vettore parallelo a render
+
+`Row` guadagna il vettore dei colori. In `row.hpp` aggiungi `#include <vector>` e `#include "editor/highlight.hpp"`, e modifica la struct:
+
+```cpp
+struct Row {
+    std::string chars;
+    std::string render;
+    std::vector<Hl> hl;     // un valore per ogni carattere di render
+};
+```
+
+## editor/syntax.hpp: lo scanner
+
+Crea `src/editor/syntax.hpp`:
+
+```cpp
+#pragma once
+
+#include <algorithm>
+#include <cctype>
+#include <string_view>
+
+#include "editor/highlight.hpp"
+#include "editor/row.hpp"
+
+namespace ted {
+
+inline void update_syntax(Row& r, const Syntax* syntax) {
+    r.hl.assign(r.render.size(), Hl::Normal);
+    if (!syntax) return;
+
+    const auto& s = r.render;
+    bool prev_sep = true;
+    char in_string = 0;
+
+    auto try_keywords = [&](const auto& list, Hl kind, size_t i) -> size_t {
+        for (auto kw : list) {
+            if (std::string_view{s}.substr(i).starts_with(kw) &&
+                (i + kw.size() == s.size() || is_separator(s[i + kw.size()]))) {
+                std::ranges::fill_n(r.hl.begin() + i, kw.size(), kind);
+                return kw.size();
+            }
+        }
+        return 0;
+    };
+
+    size_t i = 0;
+    while (i < s.size()) {
+        char c = s[i];
+        Hl prev_hl = i > 0 ? r.hl[i - 1] : Hl::Normal;
+
+        // commento fino a fine riga
+        if (!in_string && c == '/' && i + 1 < s.size() && s[i + 1] == '/') {
+            std::ranges::fill(r.hl.begin() + i, r.hl.end(), Hl::Comment);
+            break;
+        }
+
+        // stringhe e caratteri
+        if (in_string) {
+            r.hl[i] = Hl::String;
+            if (c == '\\' && i + 1 < s.size()) {
+                r.hl[i + 1] = Hl::String;
+                i += 2;
+                continue;
+            }
+            if (c == in_string) in_string = 0;
+            prev_sep = true;
+            ++i;
+            continue;
+        } else if (c == '"' || c == '\'') {
+            in_string = c;
+            r.hl[i] = Hl::String;
+            ++i;
+            continue;
+        }
+
+        // numeri
+        bool digit = std::isdigit(static_cast<unsigned char>(c));
+        if ((digit && (prev_sep || prev_hl == Hl::Number)) ||
+            (c == '.' && prev_hl == Hl::Number)) {
+            r.hl[i] = Hl::Number;
+            prev_sep = false;
+            ++i;
+            continue;
+        }
+
+        // parole chiave: solo all'inizio di una parola
+        if (prev_sep) {
+            size_t n = try_keywords(syntax->keywords1, Hl::Keyword1, i);
+            if (n == 0) n = try_keywords(syntax->keywords2, Hl::Keyword2, i);
+            if (n > 0) {
+                i += n;
+                prev_sep = false;
+                continue;
+            }
+        }
+
+        prev_sep = is_separator(c);
+        ++i;
+    }
+}
+
+}  // namespace ted
+```
+
+`prev_sep` ricorda se il carattere precedente era un separatore: serve a non colorare `int` dentro `print` o `1` dentro `x1`. Il controllo sul carattere **dopo** la keyword evita di colorare `int` in `integer`.
+
+Lo scanner è una funzione libera che riceve la riga e il linguaggio: **non conosce l'Editor**, e quindi si potrebbe testare da solo.
+
+## editor.hpp: collegare tutto
+
+Aggiungi gli include `<filesystem>` e `"editor/syntax.hpp"` e un membro:
+
+```cpp
+const Syntax* syntax = nullptr;
+```
+
+Ricordi `update_row()` della parte 5? Era il punto unico in cui si aggiornava una riga. Ora vi aggiungiamo i colori, e **tutte** le operazioni di editing li ottengono senza toccarle:
+
+```cpp
+void update_row(Row& r) {
+    update_render(r);
+    update_syntax(r, syntax);
+}
+```
+
+Scegliere il linguaggio dal nome del file:
+
+```cpp
+void select_syntax() {
+    syntax = nullptr;
+    if (filename.empty()) return;
+    auto ext = std::filesystem::path{filename}.extension().string();
+    if (std::ranges::find(cpp_syntax.extensions, ext) != cpp_syntax.extensions.end())
+        syntax = &cpp_syntax;
+    for (auto& r : rows) update_row(r);
+}
+```
+
+Chiamala alla fine di `open()` e, in `save()`, subito dopo aver assegnato `filename = *name`: salvando un file senza nome come `x.cpp`, i colori compaiono subito.
+
+## Disegnare con i colori
+
+Nel ramo "else" di `draw_rows()` sostituiamo l'`append` semplice con un ciclo che emette una sequenza di escape **solo quando il colore cambia**:
+
+```cpp
+const auto& row = rows[filerow];
+int len = std::clamp(static_cast<int>(row.render.size()) - col_off, 0, screen_cols);
+Hl current = Hl::Normal;
+for (int j = 0; j < len; ++j) {
+    Hl h = row.hl[col_off + j];
+    if (h != current) {
+        current = h;
+        out += std::format("\x1b[{}m", hl_color(h));
+    }
+    out += row.render[col_off + j];
+}
+out += "\x1b[39m";
+```
+
+## Evidenziare i risultati della ricerca
+
+Per colorare l'occorrenza trovata, la ricerca deve sovrascrivere temporaneamente `hl` e **ripristinarlo** al tasto successivo. Due membri in `Editor`:
+
+```cpp
+int saved_hl_line = -1;
+std::vector<Hl> saved_hl;
+```
+
+All'inizio di `find_callback`, prima di tutto:
+
+```cpp
+if (saved_hl_line != -1) {
+    rows[saved_hl_line].hl = saved_hl;
+    saved_hl_line = -1;
+}
+```
+
+E quando trovi una corrispondenza, nel ramo `if (pos != std::string::npos)`:
+
+```cpp
+saved_hl_line = current;
+saved_hl = rows[current].hl;
+std::ranges::fill_n(rows[current].hl.begin() + pos, query.size(), Hl::Match);
+```
+
+## Provalo
+
+```bash
+make run FILE=src/main.cpp
+```
+
+Dovresti vedere il sorgente di `ted` colorato dal `ted` stesso. Apri un `.txt`: niente colori. Cerca con **Ctrl-F**: l'occorrenza è in blu.
+
+## Conclusione e prossimi passi
+
+Hai scritto un editor di testo funzionante in C++23, con RAII per il terminale, `std::expected` per gli errori, `std::format` per l'output, un modello di dati chiaro e un progetto organizzato in moduli con dipendenze a senso unico. Se vuoi continuare, alcune idee in ordine di difficoltà:
+
+- **Commenti multi-riga** `/* ... */`: l'highlighting di una riga dipende dallo stato della riga precedente.
+- **Ricerca case-insensitive** e **sostituisci**.
+- **Passare a `.hpp` + `.cpp`**: sposta il corpo dei metodi di `Editor` in `src/editor/editor.cpp`. Il Makefile **non cambia**, perché `find` raccoglie già tutti i `.cpp`. Dovrai rimuovere `inline` dalle funzioni libere che sposti e dichiararle negli header.
+- **Undo/redo**: uno stack di comandi inversi, magari con `std::vector` di oggetti `Command` o `std::variant`.
+- **UTF-8** corretto: cursore per code point e larghezza dei caratteri.
+- **Struttura dati migliore** per testi grandi: gap buffer o piece table al posto di `std::vector<Row>`.
+- **Moduli C++20/23** (`import`) al posto degli header.
+- **Test**: separare la logica di editing dall'I/O del terminale per poterla testare con un framework. `row.hpp` e `syntax.hpp` sono già indipendenti dal terminale, quindi sono un ottimo punto di partenza.
+
+Grazie per aver seguito la serie!

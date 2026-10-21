@@ -1,0 +1,172 @@
+---
+title: "std::pmr in C++: controllare le allocazioni senza cambiare i tipi"
+description: "Come funzionano polymorphic memory resources, memory_resource e monotonic_buffer_resource, quando sono utili e quali errori di lifetime evitare."
+date: "2026-10-15"
+author: "Mattia Pirazzi"
+tags: ["C++", "performance", "memoria", "C++17"]
+coverImage: "https://images.unsplash.com/photo-1515879218367-8466d910aaa4?auto=format&fit=crop&w=1600&q=85"
+---
+
+# `std::pmr` in C++: controllare le allocazioni senza cambiare i tipi
+
+Le allocazioni dinamiche sono una parte normale della programmazione C++, ma possono diventare costose quando un'applicazione crea moltissimi oggetti piccoli o ricostruisce ripetutamente strutture temporanee. Una risposta istintiva è scrivere un allocatore personalizzato per ogni container. Questo approccio può funzionare, ma aumenta la complessità dei tipi e può rendere difficile combinare componenti diversi.
+
+La libreria `std::pmr`, introdotta in C++17, offre un modello alternativo: i container compatibili possono ricevere una risorsa di memoria a runtime, tramite `std::pmr::memory_resource`. In questo modo il tipo del container resta sostanzialmente lo stesso, mentre la strategia di allocazione può essere scelta in base al contesto.
+
+## 1. Che cosa cambia rispetto agli allocator tradizionali
+
+Un `std::vector<T>` standard usa il proprio tipo di allocator come parte del tipo del container. Con un allocator personalizzato, il tipo del vettore cambia e la compatibilità tra container può diventare più complicata.
+
+`std::pmr::vector<T>` è un alias per un `std::vector` che usa `std::pmr::polymorphic_allocator<T>`. Questo allocator delega le richieste a una risorsa di memoria selezionata a runtime. Il container non deve conoscere la strategia concreta: riceve una risorsa e la usa per ottenere memoria.
+
+```cpp
+#include <memory_resource>
+#include <string>
+#include <vector>
+
+int main()
+{
+    std::pmr::monotonic_buffer_resource arena;
+
+    std::pmr::vector<std::pmr::string> names{&arena};
+    names.emplace_back("Ada");
+    names.emplace_back("Grace");
+    names.emplace_back("Barbara");
+}
+```
+
+L'esempio usa una risorsa monotona e stringhe PMR. L'oggetto `arena` deve vivere più a lungo di tutti i container e degli oggetti che dipendono dalla sua memoria. In questo esempio, la dichiarazione dell'arena precede quella del vettore: gli oggetti vengono distrutti in ordine inverso, quindi il vettore viene distrutto prima della risorsa.
+
+La regola del lifetime è centrale. Una risorsa non è semplicemente una preferenza di performance: è un oggetto da cui dipendono le allocazioni. Se viene distrutta mentre un container la usa ancora, il programma non è corretto.
+
+## 2. `memory_resource`: l'interfaccia comune
+
+`std::pmr::memory_resource` definisce l'interfaccia per richiedere e rilasciare blocchi di memoria. Le implementazioni concrete forniscono la strategia. La libreria include, tra le altre, risorse basate su `new_delete_resource`, `null_memory_resource`, `monotonic_buffer_resource`, `unsynchronized_pool_resource` e `synchronized_pool_resource`.
+
+La risorsa predefinita è accessibile con `std::pmr::get_default_resource()`. È possibile impostare una risorsa predefinita per una parte dell'applicazione, ma cambiare globalmente o in modo implicito il comportamento delle allocazioni richiede disciplina: il codice che dipende dalla risorsa deve avere una chiara aspettativa su chi la possiede e quanto vive.
+
+Il vantaggio della type erasure è che componenti diversi possono usare la stessa interfaccia senza conoscere la classe concreta. Il costo è una forma di indirezione virtuale nell'allocazione; nella maggior parte dei casi, il beneficio va valutato rispetto al costo delle allocazioni stesse e al modello d'uso.
+
+## 3. `monotonic_buffer_resource`: allocare velocemente, liberare in blocco
+
+Una risorsa monotona è utile quando molte allocazioni hanno una durata comune. Le allocazioni individuali non vengono normalmente restituite alla risorsa una per una; la memoria viene recuperata quando la risorsa viene rilasciata o distrutta.
+
+```cpp
+#include <array>
+#include <memory_resource>
+#include <string>
+#include <vector>
+
+int main()
+{
+    std::array<std::byte, 16 * 1024> storage;
+
+    std::pmr::monotonic_buffer_resource arena{
+        storage.data(),
+        storage.size()
+    };
+
+    std::pmr::vector<std::pmr::string> tokens{&arena};
+    tokens.emplace_back("GET");
+    tokens.emplace_back("/api/items");
+    tokens.emplace_back("HTTP/1.1");
+}
+```
+
+Qui la risorsa usa prima il buffer fornito. Se il buffer non basta, il costruttore predefinito di crescita può richiedere ulteriori blocchi dal provider a monte, che per default è la risorsa new/delete. Se si vuole impedire ogni fallback, si può usare `std::pmr::null_memory_resource()` come upstream: una richiesta oltre il buffer disponibile fallirà, normalmente tramite `std::bad_alloc`.
+
+La risorsa monotona è adatta, per esempio, a un parser che crea molti nodi temporanei e li scarta tutti al termine dell'elaborazione. È meno adatta a un contenitore a lunga vita che inserisce e rimuove elementi continuamente: le allocazioni rimosse non restituiscono necessariamente spazio riutilizzabile all'arena, quindi il consumo può crescere fino al rilascio dell'intera risorsa.
+
+## 4. Pool resource: riutilizzare blocchi
+
+`std::pmr::unsynchronized_pool_resource` organizza le allocazioni in pool, con l'obiettivo di riutilizzare blocchi di dimensioni simili. Può essere utile per strutture che allocano e deallocano molti oggetti piccoli durante la propria vita.
+
+La variante *unsynchronized* non è sicura per accessi concorrenti senza sincronizzazione esterna. `std::pmr::synchronized_pool_resource` permette l'uso concorrente della risorsa, ma la sincronizzazione ha un costo e non significa che il container stesso diventi thread-safe. Due thread non possono modificare liberamente lo stesso `std::pmr::vector` soltanto perché il suo allocator usa una risorsa sincronizzata.
+
+La scelta della risorsa dovrebbe seguire il pattern delle allocazioni:
+- arena monotona per oggetti temporanei con una durata comune;
+- pool per allocazioni e deallocazioni ripetute di dimensioni ricorrenti;
+- risorsa predefinita quando il comportamento standard è già adeguato.
+
+Non esiste una risorsa universalmente più veloce. Il risultato dipende da dimensione e numero delle allocazioni, durata degli oggetti, contesa tra thread e comportamento del sistema.
+
+## 5. Una risorsa con buffer fisso
+
+Per un contesto in cui si vuole limitare il fallback, si può associare un buffer fisso a una risorsa monotona e impostare `null_memory_resource` come upstream:
+
+```cpp
+#include <array>
+#include <cstddef>
+#include <memory_resource>
+#include <vector>
+
+int main()
+{
+    std::array<std::byte, 4096> buffer;
+
+    std::pmr::monotonic_buffer_resource arena{
+        buffer.data(),
+        buffer.size(),
+        std::pmr::null_memory_resource()
+    };
+
+    std::pmr::vector<int> values{&arena};
+
+    for (int i = 0; i < 100; ++i) {
+        values.push_back(i);
+    }
+}
+```
+
+Il buffer non garantisce che ogni programma che lo usa resti entro 4096 byte: il container può richiedere capacità aggiuntiva durante la crescita, e gli allineamenti influenzano lo spazio effettivamente disponibile. Se la risorsa esaurisce il buffer, l'allocazione fallisce. Il programma deve essere progettato per gestire questa possibilità, eventualmente riservando capacità in anticipo o scegliendo un limite più adeguato.
+
+Il buffer fornito deve avere un allineamento sufficiente per gli oggetti che verranno allocati. `std::array<std::byte, N>` è normalmente adeguato per molti casi ordinari, ma requisiti di over-alignment richiedono una verifica esplicita.
+
+## 6. Il pericolo dei riferimenti oltre la vita della risorsa
+
+Consideriamo una funzione che restituisce un container PMR costruito con una risorsa locale:
+
+```cpp
+std::pmr::vector<int> make_values()
+{
+    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::vector<int> values{&arena};
+
+    values.push_back(1);
+    values.push_back(2);
+
+    return values; // Non è un risultato valido da usare così.
+}
+```
+
+Il problema è che il vettore conserva un allocator che punta alla risorsa locale. Quando la funzione ritorna, `arena` viene distrutta; il vettore restituito continua a dipendere da una risorsa che non esiste più. Anche se il trasferimento del container riesce, il lifetime della risorsa resta invalido.
+
+Le soluzioni dipendono dall'API. Si può far possedere la risorsa a un oggetto che vive più a lungo, restituire un oggetto wrapper che contiene sia risorsa sia container con un ordine di distruzione corretto, oppure trasferire i dati in un container con una risorsa indipendente. Non basta spostare il container: il move non trasferisce automaticamente la proprietà della risorsa esterna.
+
+Anche il trasferimento tra container PMR con risorse differenti richiede attenzione. La propagazione dell'allocator e le regole di uguaglianza della risorsa influenzano se un'operazione può trasferire il buffer o deve allocare e spostare gli elementi.
+
+## 7. `pmr::string` e allocazioni annidate
+
+Un vantaggio di PMR emerge quando anche i tipi annidati usano lo stesso modello di allocazione. Un `std::pmr::vector<std::pmr::string>` può propagare la risorsa alle stringhe create tramite il container. Al contrario, un `std::pmr::vector<std::string>` usa la risorsa per il buffer del vettore, ma le allocazioni interne delle `std::string` restano governate dal loro allocator standard.
+
+Questa differenza è importante quando si vuole controllare l'intero grafo delle allocazioni. La risorsa PMR non intercetta magicamente ogni `new` eseguito dal programma: soltanto gli oggetti che usano allocator compatibili passano attraverso di essa.
+
+Per lo stesso motivo, una libreria di terze parti che crea internamente oggetti con allocator standard può continuare ad allocare al di fuori dell'arena. Se il requisito è un limite rigoroso di memoria, occorre verificare l'intera catena di allocazione, non soltanto il container più visibile.
+
+## 8. Come misurare il risultato
+
+Prima di adottare PMR per ragioni di performance, costruire un benchmark che rappresenti il carico reale. Misurare solo il tempo di `push_back` su un vettore minuscolo può nascondere i costi di inizializzazione della risorsa o ignorare il lavoro di distruzione.
+
+Una misura sensata può confrontare:
+- allocatore standard;
+- arena monotona con buffer preallocato;
+- pool resource;
+- numero di allocazioni, memoria totale richiesta e tempo complessivo.
+
+Eseguire più iterazioni, evitare di includere output su terminale nel percorso misurato e usare input realistici. Se il codice è multithread, misurare anche la contesa. La risorsa più rapida in un benchmark sintetico potrebbe essere peggiore per l'applicazione completa.
+
+## Conclusione
+
+`std::pmr` separa il tipo del container dalla strategia di allocazione, rendendo possibile scegliere a runtime una risorsa adatta al pattern di vita degli oggetti. Le risorse monotone sono utili per allocazioni temporanee da liberare in blocco; le pool possono aiutare con allocazioni ripetute; la risorsa standard resta spesso la scelta più semplice.
+
+Il costo maggiore di PMR non è necessariamente prestazionale, ma progettuale: la risorsa ha un lifetime, i container ne dipendono e le allocazioni annidate devono usare allocator compatibili per rientrare nella stessa strategia. Quando il modello di vita è chiaro e le misure confermano il beneficio, PMR può essere uno strumento molto efficace.

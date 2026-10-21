@@ -1,0 +1,95 @@
+---
+title: "Cosa rende un container un container: namespaces e cgroups"
+description: "I meccanismi del kernel Linux dietro i container: isolamento dei processi, limiti delle risorse e perché Docker non è una macchina virtuale."
+date: "2026-10-15"
+author: "Mattia Pirazzi"
+tags: ["Linux", "Docker", "container", "sistemi"]
+coverImage: "https://images.unsplash.com/photo-1558494949-ef010cbdcc31?auto=format&fit=crop&w=1600&q=85"
+---
+
+# Cosa rende un container un container: namespaces e cgroups
+
+I container sono diventati uno strumento comune per distribuire applicazioni, ma la parola può far pensare a una piccola macchina virtuale. Su Linux, un container tradizionale non avvia necessariamente un kernel separato: è un insieme di processi che usa il kernel dell'host, con viste del sistema e risorse controllate attraverso funzionalità del kernel.
+
+Docker, Podman e altri strumenti rendono queste funzionalità accessibili con un'interfaccia comoda. Per capire cosa succede davvero, però, è utile separare i due meccanismi più importanti: *namespaces*, che isolano ciò che un processo può vedere, e *cgroups*, che organizzano e limitano il consumo delle risorse.
+
+## Un'immagine non è un sistema operativo avviato
+
+Un'immagine container è un insieme di filesystem e metadati: contiene, per esempio, librerie, binari, configurazioni e l'indicazione del processo da avviare. Quando il runtime crea un container, prepara un ambiente per i processi e li avvia usando il kernel Linux già in esecuzione sull'host.
+
+Questo spiega perché un container Linux non può usare liberamente un kernel Linux di versione diversa come farebbe una macchina virtuale completa. Il container può avere una distribuzione utente diversa, ma le chiamate di sistema vengono gestite dal kernel dell'host. La compatibilità dipende quindi dal kernel e dalle funzionalità disponibili, non soltanto dal contenuto dell'immagine.
+
+Una macchina virtuale, al contrario, emula o virtualizza hardware e avvia un proprio kernel guest. Offre un confine di isolamento differente e generalmente più forte, anche se richiede più risorse. Container e VM non sono concorrenti assoluti: spesso vengono usati insieme.
+
+## Namespaces: dare viste differenti del sistema
+
+Un namespace modifica la vista di una risorsa globale per i processi che vi appartengono. Linux ne offre diversi, ciascuno con una responsabilità specifica.
+
+| Namespace | Che cosa isola o modifica |
+| --- | --- |
+| PID | La vista degli identificatori dei processi |
+| Network | Interfacce, indirizzi, route, porte e stack di rete |
+| Mount | La vista dei mount point e del filesystem montato |
+| UTS | Il nome host e il nome di dominio NIS |
+| IPC | Alcune risorse di comunicazione interprocesso |
+| User | Le mappature degli identificatori utente e gruppo |
+| Cgroup | La vista della gerarchia dei cgroup |
+
+Non tutti i container usano necessariamente la stessa combinazione di namespaces. La configurazione dipende dal runtime, dai permessi, dalle opzioni scelte e dalla piattaforma.
+
+Il namespace PID è un esempio intuitivo. Un processo può vedere sé stesso come PID 1 dentro un container, mentre sull'host ha un PID differente. Non è una contraddizione: gli identificatori sono interpretati rispetto alla vista del namespace. Essere PID 1 ha anche conseguenze pratiche: il processo può ricevere responsabilità speciali nella gestione dei figli e dei segnali. Per questo, un container che esegue direttamente un'applicazione deve gestire correttamente i segnali di terminazione e i processi figli.
+
+Il namespace di rete permette a un container di avere interfacce e route proprie. Un runtime può collegarlo all'host tramite una coppia di interfacce virtuali, assegnare un indirizzo privato e configurare regole di forwarding o NAT. La rete del container non è quindi una magia di Docker: è costruita usando primitive Linux, spesso insieme a bridge, routing e firewall.
+
+## Cgroups: limitare e contabilizzare le risorse
+
+L'isolamento della vista non impedisce a un processo di consumare tutta la CPU o la memoria disponibile. È qui che entrano in gioco i *control groups*, o cgroups. Permettono al kernel di organizzare processi in gruppi e applicare politiche sulle risorse.
+
+A seconda della versione del kernel e della configurazione, i controller possono gestire CPU, memoria, I/O e altri aspetti. Per esempio, un limite di memoria può far sì che il gruppo non possa crescere oltre una soglia impostata; un limite o peso CPU può influire su quanto tempo di processore riceve rispetto ad altri gruppi.
+
+I cgroups non sono un firewall e non nascondono i processi. Sono un sistema di contabilizzazione e controllo delle risorse. Allo stesso modo, un namespace di rete non limita automaticamente la memoria del container. I due meccanismi rispondono a domande differenti e lavorano insieme.
+
+## Il filesystem: root filesystem, mount e livelli
+
+Quando si avvia un container, il runtime prepara un filesystem che il processo vedrà come radice, spesso attraverso funzionalità di mount e un namespace di mount. Le immagini sono comunemente composte da livelli immutabili, mentre le scritture del container finiscono in un livello separato o in volumi montati.
+
+Questo modello rende efficiente la distribuzione: più container possono riutilizzare livelli identici senza memorizzare copie complete. Ma introduce una distinzione importante per chi gestisce servizi persistenti: il filesystem scrivibile del container non dovrebbe essere considerato automaticamente un archivio affidabile per i dati importanti.
+
+Se si elimina e ricrea un container, il suo livello scrivibile può scomparire. Per database, librerie multimediali, configurazioni che devono sopravvivere o file degli utenti, occorre scegliere esplicitamente volumi o bind mount. I volumi Docker e i bind mount hanno comportamenti e responsabilità differenti: il bind mount collega un percorso dell'host, mentre un volume è gestito dal sistema dei volumi del runtime.
+
+## Che cosa significa davvero "isolato"?
+
+L'isolamento non equivale a sicurezza assoluta. I container condividono il kernel host; un bug nel kernel o una configurazione troppo permissiva può compromettere il confine. Inoltre, montare directory sensibili dell'host, usare il container in modalità privilegiata o concedere capability non necessarie riduce drasticamente il valore dell'isolamento.
+
+Una configurazione più prudente segue il principio del privilegio minimo: eseguire l'applicazione come utente non root quando possibile, evitare `--privileged`, limitare le capability, impostare limiti di risorse e montare soltanto i percorsi necessari. Le user namespaces possono inoltre aiutare a mappare l'utente root interno a un'identità non privilegiata sull'host, se il runtime e la configurazione lo supportano.
+
+La sicurezza dipende dall'intero sistema: immagine di partenza, aggiornamenti, segreti, permessi, rete, mount, runtime e kernel. Nessuna singola opzione rende un container automaticamente sicuro.
+
+## Osservare i meccanismi dal sistema
+
+Su un host Linux, alcuni comandi aiutano a collegare la teoria alla pratica:
+
+```bash
+# Elenca i namespace associati a un processo
+ls -l /proc/$$/ns
+
+# Mostra i cgroup del processo corrente
+cat /proc/$$/cgroup
+
+# Visualizza le informazioni sui mount
+findmnt
+```
+
+Per confrontare l'host e un container, si può ottenere il PID del processo dal runtime e ispezionare le informazioni corrispondenti in `/proc`. È però necessario distinguere il PID visto dentro il container da quello visto sull'host. Inoltre, il layout e i controller dei cgroups possono cambiare tra cgroups v1 e v2; per leggere dati reali conviene verificare la configurazione del proprio sistema invece di copiare percorsi alla cieca.
+
+## Docker è un runtime, non il meccanismo di isolamento in sé
+
+Docker integra immagini, rete, volumi, gestione dei processi e strumenti per lo sviluppo. Il lavoro di basso livello coinvolge componenti e interfacce del sistema Linux, come namespaces, cgroups, mount e capability. Altri strumenti possono usare molte delle stesse primitive pur offrendo flussi di lavoro differenti.
+
+Questa distinzione è utile anche quando qualcosa non funziona. Se un'applicazione non raggiunge la rete, la causa può essere nella configurazione del namespace di rete, nel bridge, nel DNS o nel firewall. Se viene terminata per memoria, il problema può essere un limite di cgroup. Se i dati spariscono dopo una ricreazione, probabilmente il problema riguarda il filesystem persistente, non i namespaces.
+
+## Conclusione
+
+I container Linux sono processi ordinari eseguiti con un insieme di confini e politiche applicate dal kernel. I namespaces controllano la vista di risorse come processi, rete e mount; i cgroups misurano e limitano l'uso di risorse come CPU e memoria. Il runtime coordina questi meccanismi e aggiunge convenzioni utili per immagini, volumi e distribuzione.
+
+Comprendere questa architettura aiuta a fare debugging e a prendere decisioni più consapevoli su sicurezza, prestazioni e persistenza. Quando un container sembra una scatola autonoma, ricordare che condivide il kernel dell'host è spesso il primo passo per capire cosa può fare e quali rischi restano.

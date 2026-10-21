@@ -1,0 +1,144 @@
+---
+title: "Crea il tuo text editor in C++23: input da tastiera e cursore"
+description: "Decodifichiamo le sequenze di escape di frecce, Home, End e Page Up/Down in terminal/input.hpp e muoviamo il cursore dentro lo schermo."
+date: "2026-10-21"
+author: "Mattia"
+tags: ["c++", "c++23", "input", "escape sequences", "text editor"]
+series: "crea-il-tuo-text-editor"
+order: 4
+---
+
+Ora facciamo reagire l'editor ai tasti speciali. Per ora il cursore si muoverà solo nei confini dello schermo; dalla parte 5 seguirà il contenuto di un file.
+
+In questa parte **non nascono file nuovi**: modifichiamo `terminal/input.hpp` (decodifica dei tasti) ed `editor/editor.hpp` (cosa fare con i tasti). `main.cpp` resta com'è.
+
+## terminal/input.hpp: una enum per i tasti
+
+I tasti normali hanno codici da 0 a 255. Per i tasti speciali (frecce, Home, End...) ci servono codici che **non collidano** con i caratteri, quindi partiamo da 1000. Aggiungi la enum in `input.hpp`, sotto `ctrl`:
+
+```cpp
+enum Key : int {
+    Backspace = 127,
+    ArrowLeft = 1000,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    Del,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+};
+```
+
+Usiamo una enum *non scoped* di proposito: i suoi valori si confrontano direttamente con gli `int` restituiti da `read_key()` e con i `case` di uno `switch`.
+
+## Decodificare le sequenze di escape
+
+Dalla parte 2 sappiamo che la freccia su arriva come tre byte: `\x1b`, `[`, `A`. Il problema: come distinguere un utente che preme **Esc** dall'inizio di una sequenza? Il trucco è il timeout di `VTIME`: se dopo `\x1b` non arriva nulla entro 100 ms, era un Esc vero.
+
+Diversi terminali usano codifiche diverse per Home e End (`\x1b[1~`, `\x1b[7~`, `\x1b[H`, `\x1bOH`...), quindi le gestiamo tutte. Sostituisci `read_key()` in `input.hpp` con questa versione:
+
+```cpp
+inline int read_key() {
+    char c;
+    for (;;) {
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n == 1) break;
+        if (n == -1 && errno != EAGAIN)
+            throw std::system_error{errno, std::generic_category(), "read"};
+    }
+
+    if (c != '\x1b') return static_cast<unsigned char>(c);
+
+    char seq[3];
+    if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+    if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+
+    if (seq[0] == '[') {
+        if (seq[1] >= '0' && seq[1] <= '9') {
+            if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
+            if (seq[2] == '~') {
+                switch (seq[1]) {
+                case '1': return Home;
+                case '3': return Del;
+                case '4': return End;
+                case '5': return PageUp;
+                case '6': return PageDown;
+                case '7': return Home;
+                case '8': return End;
+                }
+            }
+        } else {
+            switch (seq[1]) {
+            case 'A': return ArrowUp;
+            case 'B': return ArrowDown;
+            case 'C': return ArrowRight;
+            case 'D': return ArrowLeft;
+            case 'H': return Home;
+            case 'F': return End;
+            }
+        }
+    } else if (seq[0] == 'O') {
+        switch (seq[1]) {
+        case 'H': return Home;
+        case 'F': return End;
+        }
+    }
+    return '\x1b';
+}
+```
+
+È la parte più "brutta" dell'intero editor, ed è brutta perché i terminali sono brutti: un'eredità di decenni di standard sovrapposti. Il vantaggio dell'avere tutto in `input.hpp` è che questo disordine resta **confinato in un solo file**: l'`Editor` vede solo `ArrowUp`, `Home`, `PageDown`.
+
+## editor/editor.hpp: muovere il cursore
+
+Aggiungi a `Editor` un metodo per spostare `cx` e `cy` restando dentro lo schermo:
+
+```cpp
+void move_cursor(int key) {
+    switch (key) {
+    case ArrowLeft:  if (cx > 0) --cx; break;
+    case ArrowRight: if (cx < screen_cols - 1) ++cx; break;
+    case ArrowUp:    if (cy > 0) --cy; break;
+    case ArrowDown:  if (cy < screen_rows - 1) ++cy; break;
+    }
+}
+```
+
+E sostituisci `process_keypress()`:
+
+```cpp
+bool process_keypress() {
+    int c = read_key();
+    switch (c) {
+    case ctrl('q'):
+        return false;
+
+    case Home: cx = 0; break;
+    case End:  cx = screen_cols - 1; break;
+
+    case PageUp:
+    case PageDown:
+        for (int n = screen_rows; n > 0; --n)
+            move_cursor(c == PageUp ? ArrowUp : ArrowDown);
+        break;
+
+    case ArrowLeft:
+    case ArrowRight:
+    case ArrowUp:
+    case ArrowDown:
+        move_cursor(c);
+        break;
+    }
+    return true;
+}
+```
+
+Page Up/Down per ora si limitano a portare il cursore in cima o in fondo allo schermo, simulando tante pressioni di freccia.
+
+## Provalo
+
+`make && ./ted`: le frecce muovono il cursore, Home/End lo portano agli estremi della riga, Page Up/Down agli estremi della colonna. Il testo di benvenuto non si sposta, perché il cursore è solo una posizione sullo schermo.
+
+Nella prossima parte l'editor impara a **leggere un file** e a mostrarlo, con scrolling verticale e orizzontale.

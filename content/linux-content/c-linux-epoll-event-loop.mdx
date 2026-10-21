@@ -1,0 +1,182 @@
+---
+title: "Costruire un server TCP con epoll su Linux"
+description: "Dalla socket bloccante a un event loop non bloccante: epoll, readiness, gestione parziale di send e recv, e limiti di un server didattico."
+date: "2026-10-15"
+author: "Mattia Pirazzi"
+tags: ["C", "Linux", "reti", "POSIX"]
+coverImage: "https://images.unsplash.com/photo-1558494949-ef010cbdcc31?auto=format&fit=crop&w=1600&q=85"
+---
+
+# Costruire un server TCP con `epoll` su Linux
+
+Un server TCP può essere implementato creando un thread per ogni connessione, ma questo modello non è sempre adatto quando il numero di client cresce. Ogni thread ha costi di memoria e scheduling, e un server con molte connessioni inattive può spendere risorse per thread che passano gran parte del tempo in attesa.
+
+Su Linux, `epoll` consente a un processo di attendere eventi su molte descrittori di file attraverso un event loop. È una tecnica centrale in diversi server e runtime di rete, ma non è una scorciatoia automatica verso prestazioni elevate: bisogna progettare correttamente le socket non bloccanti, i buffer e il ciclo di vita delle connessioni.
+
+Questo articolo costruisce il modello mentale, spiega le chiamate fondamentali e presenta un nucleo di server minimale. Non è un server pronto per Internet: mancano timeout, limiti di risorse, logging strutturato, gestione completa dei segnali e politiche di produzione.
+
+## 1. Il modello a event loop
+
+Un server TCP classico esegue `socket`, `bind`, `listen` e poi `accept`. Se ogni socket viene usata in modalità bloccante, una lettura da un client lento può fermare il thread che la esegue. Una strategia è assegnare ogni connessione a un thread dedicato; un'altra è usare I/O non bloccante e attendere soltanto i descrittori pronti.
+
+Con un event loop, il server ripete un ciclo:
+
+1. Attende che uno o più descrittori diventino pronti.
+2. Identifica quali eventi sono accaduti.
+3. Esegue una quantità limitata di lavoro per ciascun descrittore.
+4. Aggiorna l'interesse per gli eventi futuri.
+5. Torna ad attendere.
+
+La readiness non significa che un'intera richiesta sia disponibile o che una scrittura completa avrà successo. Indica che un'operazione può essere tentata senza bloccarsi per il motivo che ha generato l'evento. Le chiamate possono comunque trasferire soltanto una parte dei dati, oppure restituire `EAGAIN`/`EWOULDBLOCK` se la condizione è cambiata.
+
+## 2. Preparare il listener
+
+Il listener deve essere configurato in modo intenzionale. `SO_REUSEADDR` è comunemente usato per facilitare il riavvio del server in condizioni previste, mentre `fcntl` può impostare `O_NONBLOCK` sul descrittore. È importante controllare ogni valore di ritorno: ignorare un errore di configurazione può far sì che il server parta in uno stato diverso da quello atteso.
+
+Il percorso iniziale è:
+
+```c
+int listener = socket(AF_INET, SOCK_STREAM, 0);
+if (listener == -1) {
+    perror("socket");
+    exit(EXIT_FAILURE);
+}
+
+int enabled = 1;
+if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
+               &enabled, sizeof(enabled)) == -1) {
+    perror("setsockopt");
+    close(listener);
+    exit(EXIT_FAILURE);
+}
+
+/* Preparare sockaddr_in, poi bind() e listen(). */
+```
+
+Per un server esposto solo sulla macchina di test, `INADDR_LOOPBACK` limita l'ascolto al loopback IPv4. Per un servizio accessibile dalla LAN, si può usare l'indirizzo LAN o `INADDR_ANY`, valutando firewall e superficie di esposizione. Legare il servizio a tutte le interfacce non è una decisione neutra.
+
+Dopo `listen`, il listener va reso non bloccante. Quando arriva un evento di leggibilità sul listener, il server chiama `accept` in un ciclo finché non trova più connessioni in coda. Anche `accept` può essere interrotto o restituire `EAGAIN`; un server robusto distingue gli errori temporanei da quelli definitivi.
+
+## 3. Creare la coda di eventi
+
+`epoll_create1(EPOLL_CLOEXEC)` crea un'istanza epoll. `epoll_ctl` aggiunge, modifica o rimuove descrittori dal set monitorato, mentre `epoll_wait` attende eventi e riempie un array di `struct epoll_event`.
+
+```c
+int epfd = epoll_create1(EPOLL_CLOEXEC);
+if (epfd == -1) {
+    perror("epoll_create1");
+    close(listener);
+    exit(EXIT_FAILURE);
+}
+
+struct epoll_event event = {
+    .events = EPOLLIN,
+    .data.fd = listener
+};
+
+if (epoll_ctl(epfd, EPOLL_CTL_ADD, listener, &event) == -1) {
+    perror("epoll_ctl");
+    close(epfd);
+    close(listener);
+    exit(EXIT_FAILURE);
+}
+```
+
+`EPOLLIN` richiede notifiche quando il descrittore è pronto per la lettura. Per un listener significa normalmente che una o più connessioni possono essere accettate; per una connessione TCP significa che ci sono dati da leggere, oppure che la connessione è stata chiusa o ha cambiato stato in modo che una lettura possa restituire EOF o errore.
+
+Il campo `data.fd` è un modo semplice per recuperare il descrittore quando arriva l'evento. In un server più complesso si può memorizzare un puntatore a una struttura di connessione, ma bisogna gestirne con attenzione la durata: un evento già restituito o dati pendenti non devono riferirsi a memoria liberata.
+
+## 4. Leggere correttamente: `recv` può restituire meno del previsto
+
+TCP è un flusso di byte, non un protocollo a messaggi. Se un client invia due chiamate `send`, il server potrebbe ricevere i dati in una sola `recv`, in due letture o in molte letture parziali. Il server non può dedurre i confini dei messaggi dalle chiamate del client.
+
+Un pattern di lettura per socket non bloccanti è:
+
+```c
+for (;;) {
+    char buffer[4096];
+    ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+
+    if (n > 0) {
+        /* Aggiungere i byte al buffer applicativo. */
+        continue;
+    }
+
+    if (n == 0) {
+        /* Il peer ha chiuso ordinatamente la direzione di invio. */
+        close_connection(fd);
+        break;
+    }
+
+    if (errno == EINTR) {
+        continue;
+    }
+
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        break;
+    }
+
+    /* Errore definitivo: registrare e chiudere. */
+    close_connection(fd);
+    break;
+}
+```
+
+Questo frammento è uno schema, non è compilabile da solo: `close_connection` rappresenta una funzione del server e servono gli header appropriati. In un'applicazione reale, il buffer non può essere una variabile temporanea se i dati devono essere conservati per elaborazioni successive; serve una struttura per ogni connessione.
+
+Il ramo `n == 0` indica EOF dal peer per la direzione di invio. TCP è full-duplex: una chiusura della direzione di invio non implica necessariamente che il server non possa più inviare dati. Un server può scegliere di chiudere subito oppure completare la risposta, secondo il protocollo applicativo.
+
+## 5. Scrivere correttamente: output parziale
+
+La scrittura richiede una disciplina simile. `send` può inviare soltanto una parte dei byte, specialmente quando il buffer del kernel è pieno. Il server deve conservare i byte non ancora inviati e riprovare quando il descrittore diventa pronto per la scrittura.
+
+Una struttura di connessione può contenere:
+
+```c
+struct connection {
+    int fd;
+    char *out;
+    size_t out_len;
+    size_t out_sent;
+};
+```
+
+Il campo `out_sent` indica quanti byte sono già stati inviati. Dopo una scrittura parziale, il server avanza l'indice e conserva il resto. Quando `out_sent == out_len`, può rimuovere `EPOLLOUT` dall'interesse: se il server monitora sempre la scrittura, una socket quasi sempre scrivibile può generare eventi continui e consumare CPU inutilmente.
+
+Per inviare dati, è importante gestire anche `EINTR`, `EAGAIN` e `EWOULDBLOCK`, oltre al caso di errore definitivo. Nei server che usano `send`, il flag `MSG_NOSIGNAL` su Linux può evitare che una scrittura su una connessione chiusa dal peer generi `SIGPIPE`; in alternativa, il processo può gestire il segnale secondo la propria politica.
+
+## 6. Level-triggered e edge-triggered
+
+Per default, `epoll` lavora in modalità level-triggered: finché la condizione resta vera, il descrittore può continuare a essere segnalato. Con `EPOLLET` si usa la modalità edge-triggered, in cui gli eventi notificano transizioni. In questo caso, il codice deve generalmente continuare a leggere o accettare connessioni finché l'operazione non restituisce `EAGAIN`.
+
+La modalità edge-triggered può ridurre alcune notifiche, ma rende più facile costruire un server che si blocca logicamente. Se il codice legge una sola volta e lascia dati nel buffer del kernel, potrebbe non ricevere un altro evento finché non avviene una nuova transizione. Per iniziare, level-triggered è spesso più semplice da comprendere e verificare.
+
+In entrambe le modalità, un event loop non dovrebbe lasciare che una connessione monopolizzi indefinitamente il ciclo. Sistemi ad alto carico possono usare budget di lavoro per evento e code interne, così un client che invia continuamente dati non impedisce agli altri di avanzare.
+
+## 7. Protocollo applicativo: perché TCP non basta
+
+Un server che fa semplicemente echo dei byte può sembrare completo, ma appena si elaborano richieste bisogna definire il framing. Alcuni protocolli usano delimitatori, altri una lunghezza prefissata, altri ancora strutture più elaborate. Il server deve gestire messaggi spezzati tra più `recv`, più messaggi arrivati nella stessa lettura e input che supera la dimensione massima consentita.
+
+Per un protocollo length-prefixed, per esempio, il parser deve prima raccogliere l'header, validare la lunghezza e soltanto dopo attendere il corpo. La lunghezza dichiarata va controllata prima di allocare memoria, per evitare che un client chieda allocazioni enormi. Un protocollo testuale con newline richiede invece un buffer incrementale e un limite massimo di riga.
+
+Le decisioni sul framing sono parte della sicurezza. Un server che presume che una `recv` equivalga a una richiesta intera è fragile anche se la parte di `epoll` è corretta.
+
+## 8. Pulizia e ciclo di vita dei descrittori
+
+Quando una connessione si chiude, il server deve rimuoverla dal set epoll e liberare la sua struttura. La chiusura del descrittore rimuove normalmente il monitoraggio associato, ma in un programma complesso è utile rendere esplicito il percorso di cleanup e assicurarsi di non riutilizzare un numero di descrittore ancora referenziato da strutture vecchie.
+
+I numeri dei file descriptor possono essere riutilizzati dal kernel. Se il server memorizza soltanto il numero e conserva eventi o puntatori senza un protocollo di durata, può confondere una vecchia connessione con una nuova. Questo è uno dei motivi per cui i server reali trattano la gestione delle connessioni come una macchina a stati, non come un semplice array di interi.
+
+Bisogna inoltre definire cosa succede quando il client si disconnette mentre esiste output pendente, quando `epoll_ctl` fallisce e quando `epoll_wait` viene interrotto da un segnale. Gli errori non devono essere ignorati soltanto perché il percorso comune funziona.
+
+## 9. Quando scegliere epoll
+
+`epoll` è particolarmente utile per server Linux con molte connessioni contemporanee e un modello basato su eventi. Non è automaticamente la scelta migliore per ogni programma: un client semplice, un tool interno o un servizio con poche connessioni può essere più chiaro con I/O bloccante e un numero limitato di thread.
+
+La scalabilità dipende anche da ciò che il server fa quando i dati arrivano. Se ogni evento avvia una computazione pesante, un accesso lento a disco o una chiamata bloccante, l'event loop può comunque smettere di rispondere. Spesso si separa il lavoro di rete dal lavoro CPU-bound o si usa I/O asincrono per le operazioni lente.
+
+## Conclusione
+
+`epoll` offre un meccanismo efficiente per attendere eventi su molti descrittori, ma il server deve gestire correttamente socket non bloccanti, letture e scritture parziali, framing del protocollo, errori e durata delle connessioni. La parte difficile non è chiamare `epoll_wait`: è costruire una macchina a stati che resti corretta quando gli eventi arrivano in un ordine inatteso.
+
+Un buon esercizio è implementare un echo server locale, aggiungere un buffer per connessione, gestire le scritture parziali e poi introdurre un protocollo con messaggi delimitati o length-prefixed. Ogni passaggio dovrebbe avere test per chiusure premature, input frammentato e client lenti prima di aggiungere ottimizzazioni.

@@ -1,0 +1,174 @@
+---
+title: "C++23: gestire gli errori con std::expected"
+description: "Un approccio esplicito agli errori in C++ moderno: come funziona std::expected, quando usarlo e come comporre operazioni che possono fallire."
+date: "2026-10-15"
+author: "Mattia Pirazzi"
+tags: ["C++", "C++23", "programmazione"]
+coverImage: "https://images.unsplash.com/photo-1515879218367-8466d910aaa4?auto=format&fit=crop&w=1600&q=85"
+---
+
+# C++23: gestire gli errori con `std::expected`
+
+Un programma reale non lavora sempre in condizioni ideali. Un file può non esistere, una configurazione può contenere un valore non valido, una connessione può interrompersi e una conversione può ricevere dati malformati. La qualità di un programma dipende anche da come rappresenta questi casi e da quanto è semplice per chi lo legge capire quali errori sono possibili.
+
+In C++ abbiamo tradizionalmente diverse strategie: codici di ritorno, valori sentinella, parametri di output ed eccezioni. Ciascuna ha un posto, ma tutte possono diventare scomode quando l'errore è un risultato previsto dell'operazione e non un evento eccezionale. C++23 introduce `std::expected`, un tipo che rende esplicita questa possibilità nel sistema dei tipi.
+
+## Il problema dei valori sentinella
+
+Immaginiamo una funzione che converte una stringa in un numero intero. Una soluzione ingenua potrebbe restituire `-1` quando la conversione fallisce:
+
+```cpp
+int parse_port(std::string_view text)
+{
+    // ...
+    if (/* conversione non riuscita */) {
+        return -1;
+    }
+
+    return port;
+}
+```
+
+Il chiamante deve conoscere la convenzione del valore `-1`, ricordarsi di controllarlo e distinguere l'errore da un valore valido. In altri contesti, come la ricerca di un elemento, `-1` potrebbe essere una convenzione ragionevole; in altri ancora, non esiste proprio un valore sentinella sicuro.
+
+Un'alternativa è restituire un `bool` e scrivere il risultato in un parametro di output. Questo separa il successo dal valore, ma rende la firma meno naturale e consente chiamate in cui il risultato viene ignorato per errore. I codici di errore numerici aggiungono un'altra convenzione che il chiamante deve interpretare.
+
+`std::expected<T, E>` rappresenta invece un'unica alternativa: contiene o un valore di tipo `T`, oppure un errore di tipo `E`. La firma della funzione comunica quindi entrambe le possibilità.
+
+## Il modello di `std::expected`
+
+Il tipo è definito nell'header `<expected>` ed è disponibile con C++23. Il primo parametro indica il tipo del risultato positivo, il secondo quello dell'errore.
+
+```cpp
+#include <expected>
+#include <string>
+#include <string_view>
+
+enum class ParseError {
+    EmptyInput,
+    InvalidCharacter,
+    OutOfRange
+};
+
+std::expected<int, ParseError>
+parse_port(std::string_view text);
+```
+
+Questa dichiarazione dice che la funzione può restituire una porta intera oppure un valore di `ParseError`. Non è necessario consultare la documentazione per scoprire se `-1`, `0` o un altro numero speciale segnala un problema.
+
+Quando la funzione produce un valore, il chiamante può usare `has_value()` oppure verificare direttamente l'oggetto in un contesto booleano. `value()` restituisce il risultato, ma lancia `std::bad_expected_access` se l'oggetto contiene un errore. Per codice che vuole gestire esplicitamente il ramo negativo, `operator*` e `operator->` sono comodi dopo aver verificato il successo.
+
+```cpp
+auto result = parse_port("8080");
+
+if (!result) {
+    // Gestire result.error()
+    return;
+}
+
+const int port = *result;
+```
+
+L'esempio è volutamente semplice: il punto importante è che il controllo è visibile e il risultato non può essere confuso con un codice di errore.
+
+## Un'implementazione completa
+
+La conversione di una porta deve rifiutare input vuoti, caratteri non numerici e valori fuori dall'intervallo valido. `std::from_chars`, introdotto in C++17, è adatto perché non richiede allocazioni e non dipende dalla locale.
+
+```cpp
+#include <charconv>
+#include <expected>
+#include <string_view>
+#include <system_error>
+
+enum class ParseError {
+    EmptyInput,
+    InvalidCharacter,
+    OutOfRange,
+    InvalidPort
+};
+
+std::expected<int, ParseError>
+parse_port(std::string_view text)
+{
+    if (text.empty()) {
+        return std::unexpected{ParseError::EmptyInput};
+    }
+
+    int value = 0;
+    const char* first = text.data();
+    const char* last = first + text.size();
+
+    const auto [ptr, ec] = std::from_chars(first, last, value);
+
+    if (ec == std::errc::result_out_of_range) {
+        return std::unexpected{ParseError::OutOfRange};
+    }
+
+    if (ec != std::errc{} || ptr != last) {
+        return std::unexpected{ParseError::InvalidCharacter};
+    }
+
+    if (value < 1 || value > 65535) {
+        return std::unexpected{ParseError::InvalidPort};
+    }
+
+    return value;
+}
+```
+
+`std::unexpected` costruisce il ramo di errore. Il controllo `ptr != last` è importante: senza di esso, una stringa come `"8080abc"` potrebbe essere accettata come `8080`, perché la conversione avrebbe letto soltanto il prefisso numerico.
+
+Il chiamante può tradurre l'enumerazione in un messaggio leggibile, oppure mantenere il codice di errore fino al livello dell'applicazione che sa come comunicarlo all'utente. È generalmente meglio non inserire stringhe destinate all'interfaccia dentro un errore di basso livello: un servizio, una CLI e una GUI potrebbero voler presentare lo stesso problema in modi diversi.
+
+## Propagare gli errori senza nasconderli
+
+Un caso comune è una sequenza di operazioni: leggere una configurazione, estrarre una porta e poi inizializzare un server. Se una fase fallisce, spesso non ha senso eseguire le successive.
+
+Con `std::expected`, una funzione può controllare il risultato e restituire lo stesso errore:
+
+```cpp
+std::expected<ServerConfig, ConfigError>
+load_config(const std::filesystem::path& path)
+{
+    auto text = read_file(path);
+    if (!text) {
+        return std::unexpected{text.error()};
+    }
+
+    auto port = parse_port(extract_port(*text));
+    if (!port) {
+        return std::unexpected{ConfigError::InvalidPort};
+    }
+
+    return ServerConfig{.port = *port};
+}
+```
+
+Il codice è esplicito, ma la ripetizione dei controlli può diventare rumorosa quando una pipeline contiene molte trasformazioni. `std::expected` offre operazioni come `and_then` e `transform` per comporre funzioni che restituiscono o trasformano risultati. Il supporto preciso e i vincoli dei callable dipendono dalla versione della libreria standard, quindi conviene verificare l'implementazione disponibile nel toolchain del progetto.
+
+Una distinzione utile è questa: `transform` serve quando la funzione successiva produce un valore ordinario; `and_then` è pensato per funzioni che restituiscono a loro volta un tipo risultato compatibile. Se un passaggio fallisce, l'errore viene propagato senza invocare i passaggi successivi.
+
+## `expected` oppure eccezioni?
+
+`std::expected` non rende obsolete le eccezioni. La scelta dipende dal contratto dell'operazione e dalle convenzioni del progetto.
+
+È spesso adatto quando il fallimento è una possibilità normale e prevista: validare input, interpretare configurazioni, cercare un elemento, decodificare un messaggio o leggere un file richiesto dall'utente. Il chiamante può essere obbligato, dal flusso del codice, a confrontarsi con il ramo di errore.
+
+Le eccezioni rimangono utili quando un errore non può essere gestito localmente, quando attraversa molti livelli o quando il progetto adotta una strategia basata sullo stack unwinding. Anche le API di librerie e framework possono imporre una scelta. Non è necessario convertire ogni possibile errore in `expected`, né avvolgere ogni chiamata in un `try`/`catch`.
+
+C'è inoltre una differenza importante: un oggetto `expected` non obbliga formalmente il chiamante a controllare il risultato. È un miglioramento del contratto, non una garanzia assoluta. Il progetto deve comunque stabilire convenzioni di gestione e usare revisioni del compilatore e della libreria standard che supportino C++23.
+
+## Come scegliere il tipo di errore
+
+Il parametro `E` dovrebbe contenere informazioni utili al livello chiamante. Un `enum class` è una buona scelta per un insieme piccolo e stabile di cause. Per errori più ricchi si può usare una struttura con un codice e metadati, evitando però di trasformarla in un contenitore generico e poco coerente.
+
+Non bisogna confondere il dettaglio tecnico con il messaggio da mostrare all'utente. Un errore come `PermissionDenied` può essere tradotto in un messaggio localizzato, registrato nei log con il percorso coinvolto oppure trasformato in una risposta HTTP. La funzione di basso livello dovrebbe fornire informazioni sufficienti, ma non decidere necessariamente come presentarle.
+
+Infine, occorre evitare di perdere informazioni durante la propagazione. Se ogni livello trasforma qualsiasi errore in `InvalidConfiguration`, la chiamata finale non saprà più distinguere un file mancante da un valore non valido. Quando serve aggiungere contesto, è preferibile farlo in modo intenzionale e mantenere la causa originale.
+
+## Conclusione
+
+`std::expected` rende esplicita una parte importante del contratto di una funzione: non sempre un'operazione produce il valore richiesto. Per API che incontrano errori prevedibili, permette di evitare sentinelle e parametri di output, mantenendo il flusso di controllo visibile e i tipi significativi.
+
+La scelta migliore non è usare `expected` ovunque, ma applicarlo nei punti in cui il fallimento è un risultato legittimo dell'operazione. Un buon tipo di errore, una propagazione che non distrugga il contesto e una convenzione coerente nel progetto contano più della semplice presenza di un nuovo tipo della libreria standard.

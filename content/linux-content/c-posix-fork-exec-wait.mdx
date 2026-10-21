@@ -1,0 +1,175 @@
+---
+title: "Processi Unix: capire davvero fork, exec e wait"
+description: "Come un programma C crea processi su Unix, perché fork non esegue un nuovo programma e come gestire correttamente i processi figli."
+date: "2026-10-15"
+author: "Mattia Pirazzi"
+tags: ["C", "Unix", "Linux", "sistemi operativi"]
+coverImage: "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=1600&q=85"
+---
+
+# Processi Unix: capire davvero `fork`, `exec` e `wait`
+
+Quando una shell esegue un comando, sembra che stia semplicemente avviando un programma. In realtà, nei sistemi Unix-like, dietro questa operazione c'è un piccolo protocollo tra processi: creare un figlio, sostituire il suo programma e raccoglierne il risultato. Le chiamate `fork`, `exec` e `wait` sono fondamentali per capire shell, pipeline, servizi e molti strumenti di sistema.
+
+Queste API appartengono all'interfaccia POSIX e sono disponibili su Linux e su altri sistemi Unix-like. Non sono API ISO C: un programma che le usa deve essere compilato in un ambiente che le implementi.
+
+## Un processo non è soltanto un file eseguibile
+
+Un processo è un'istanza in esecuzione di un programma, con uno spazio di indirizzamento, un identificatore (PID), uno stato di esecuzione e risorse associate. Tra queste ci sono i descrittori dei file aperti, le credenziali, la directory di lavoro e altre informazioni gestite dal kernel.
+
+Due processi possono eseguire lo stesso file binario ma avere stato, memoria e descrittori differenti. È questa separazione che permette a una shell di avviare più comandi senza trasformarsi ogni volta nel comando stesso.
+
+## `fork`: creare un processo figlio
+
+`fork()` crea un nuovo processo. Nel punto in cui la chiamata ritorna, il programma prosegue sia nel processo padre sia nel processo figlio. La differenza è il valore restituito: il padre riceve il PID del figlio, mentre il figlio riceve `0`. In caso di errore, il processo originale riceve `-1` e non viene creato alcun figlio.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+int main(void)
+{
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        perror("fork");
+        return EXIT_FAILURE;
+    }
+
+    if (pid == 0) {
+        printf("Sono il figlio: PID=%ld, PPID=%ld\n",
+               (long)getpid(), (long)getppid());
+    } else {
+        printf("Sono il padre: PID=%ld, figlio=%ld\n",
+               (long)getpid(), (long)pid);
+    }
+
+    return EXIT_SUCCESS;
+}
+```
+
+L'ordine delle due stampe non è garantito: dopo `fork`, il kernel decide quale processo eseguire per primo. Se il programma ha bisogno di un ordine specifico, deve usare una forma di sincronizzazione, non affidarsi al caso.
+
+È comune dire che `fork` copia la memoria. Dal punto di vista del programma, padre e figlio iniziano con contenuti di memoria equivalenti, ma i sistemi moderni usano normalmente una tecnica chiamata *copy-on-write*: le pagine fisiche vengono condivise finché uno dei processi non prova a modificarle. Questo evita di copiare inutilmente tutta la memoria.
+
+I descrittori dei file aperti vengono ereditati. Padre e figlio hanno descrittori distinti che, in genere, fanno riferimento alle stesse *open file description* del kernel: per esempio possono condividere l'offset di lettura di un file. Questo dettaglio diventa importante quando si costruiscono pipeline o si gestiscono socket e file.
+
+## `exec`: sostituire il programma corrente
+
+`fork` non avvia un file eseguibile diverso: crea una copia del processo. Per eseguire un altro programma si usa una delle funzioni della famiglia `exec`, per esempio `execl`, `execv` o `execvp`.
+
+Se `exec` ha successo, il nuovo programma sostituisce il codice e la memoria del processo chiamante. Il PID resta lo stesso. La chiamata non ritorna al codice precedente: ritorna soltanto se si verifica un errore.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(void)
+{
+    char *const args[] = {
+        "ls",
+        "-l",
+        "/tmp",
+        NULL
+    };
+
+    execvp(args[0], args);
+
+    /* Si arriva qui soltanto se execvp fallisce. */
+    perror("execvp");
+    return EXIT_FAILURE;
+}
+```
+
+`execvp` cerca l'eseguibile usando la variabile d'ambiente `PATH`. La variante `execv`, invece, riceve il percorso del programma senza cercarlo nel `PATH`. In tutti i casi, l'array degli argomenti deve terminare con un puntatore nullo.
+
+Perché spesso si usa `fork` seguito da `exec`? Perché il padre può preparare il processo figlio senza perdere se stesso: può redirigere l'input o l'output, chiudere descrittori non necessari e poi sostituire il programma del figlio con il comando richiesto.
+
+## `waitpid`: raccogliere il risultato
+
+Quando un figlio termina, il kernel conserva informazioni sul suo stato finché il padre non le raccoglie. Un figlio terminato ma non ancora raccolto è detto *zombie*: non continua a eseguire codice, ma mantiene una piccola voce nella tabella dei processi. `wait` e `waitpid` consentono al padre di recuperare lo stato e liberare queste informazioni.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void)
+{
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        perror("fork");
+        return EXIT_FAILURE;
+    }
+
+    if (pid == 0) {
+        execlp("sleep", "sleep", "1", (char *)NULL);
+        perror("execlp");
+        _exit(127);
+    }
+
+    int status;
+    pid_t result;
+
+    do {
+        result = waitpid(pid, &status, 0);
+    } while (result == -1 && errno == EINTR);
+
+    if (result == -1) {
+        perror("waitpid");
+        return EXIT_FAILURE;
+    }
+
+    if (WIFEXITED(status)) {
+        printf("Il figlio è terminato con codice %d\n",
+               WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        printf("Il figlio è stato terminato dal segnale %d\n",
+               WTERMSIG(status));
+    }
+
+    return EXIT_SUCCESS;
+}
+```
+
+Nell'esempio è necessario includere anche `<errno.h>` per usare `errno` ed `EINTR`. La gestione dell'interruzione è importante: una chiamata bloccante può essere interrotta da un segnale e restituire un errore temporaneo. Un programma robusto distingue questo caso da un errore definitivo.
+
+`WIFEXITED` e `WEXITSTATUS` devono essere usate insieme: il secondo macro è significativo quando il primo indica una terminazione normale. Analogamente, `WTERMSIG` va usata se `WIFSIGNALED` è vera. Il parametro `status` non è direttamente il codice restituito dal figlio: contiene informazioni codificate sul modo in cui è terminato.
+
+Nel figlio, dopo un fallimento di `exec`, si usa spesso `_exit()` anziché `exit()`. `exit()` esegue le funzioni registrate con `atexit` e svuota i buffer della libreria C; dopo `fork`, questi buffer potrebbero contenere dati ereditati dal padre e venire stampati due volte. `_exit()` termina il processo senza effettuare quelle operazioni della libreria.
+
+## Il modello completo: fork, configurazione, exec, wait
+
+La sequenza tipica è:
+
+1. Il processo padre chiama `fork`.
+2. Il figlio prepara l'ambiente necessario, per esempio redirige i descrittori standard.
+3. Il figlio chiama `exec`.
+4. Il padre chiama `waitpid` quando deve raccogliere il risultato.
+5. Il padre interpreta lo stato del figlio e decide come proseguire.
+
+Questa struttura è alla base di una shell semplice. Per una pipeline come `cat file.txt | grep errore`, la shell crea processi, collega l'output di uno all'input dell'altro con `pipe`, usa `dup2` per impostare i descrittori e chiude tutte le estremità della pipe che non servono. Se una copia non viene chiusa, il processo che legge potrebbe non ricevere mai EOF perché il kernel vede ancora un'estremità di scrittura aperta.
+
+## Errori comuni
+
+**Pensare che `fork` restituisca un solo flusso.** Il codice dopo la chiamata viene eseguito in entrambi i processi. Ogni ramo deve essere progettato esplicitamente.
+
+**Dimenticare di raccogliere i figli.** Un processo padre che crea molti figli e non usa `wait`/`waitpid` rischia di accumulare zombie.
+
+**Continuare dopo un `exec` riuscito.** Non succede: il processo esegue il nuovo programma. Il codice successivo a `exec` è un percorso di errore.
+
+**Confondere il codice di uscita con lo stato di `waitpid`.** Lo stato va interpretato tramite le macro POSIX.
+
+**Usare funzioni non sicure dopo `fork` in un programma multithread.** In un processo con più thread, dopo `fork` il figlio contiene soltanto il thread che ha chiamato la funzione, mentre i mutex possono essere rimasti in uno stato problematico. In quel contesto il codice eseguito prima di `exec` deve essere particolarmente limitato e rispettare le regole di sicurezza delle funzioni async-signal-safe.
+
+## Conclusione
+
+`fork`, `exec` e `waitpid` risolvono tre problemi distinti: creare un processo, sostituire il programma che esso esegue e raccogliere il risultato della sua terminazione. Separare questi concetti aiuta a comprendere il comportamento delle shell e delle utility Unix, ma anche a scrivere programmi C più robusti.
+
+Quando si sperimenta, conviene verificare sempre i valori di ritorno, includere gli header corretti e provare i casi di errore. Il modello diventa molto più chiaro quando si aggiungono gradualmente redirezioni, pipe e gestione dei segnali.
