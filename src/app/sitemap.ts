@@ -2,7 +2,8 @@ import { MetadataRoute } from "next";
 import { getAllPosts, getAllTags } from "@/lib/mdx";
 import { slugify } from "@/lib/utils";
 
-const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://pirazzi.blog";
+const SITE_URL =
+  process.env.NEXT_PUBLIC_SITE_URL || "https://mattiapirazzi.dev";
 
 export default function sitemap(): MetadataRoute.Sitemap {
   const posts = getAllPosts();

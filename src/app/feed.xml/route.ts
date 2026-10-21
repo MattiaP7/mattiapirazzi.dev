@@ -1,6 +1,7 @@
 import { getAllPosts } from "@/lib/mdx";
 
-const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://pirazzi.blog";
+const SITE_URL =
+  process.env.NEXT_PUBLIC_SITE_URL || "https://mattiapirazzi.dev";
 
 export async function GET() {
   const posts = getAllPosts();

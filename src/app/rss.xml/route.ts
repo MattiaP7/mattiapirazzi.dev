@@ -3,7 +3,7 @@ import { getAllPosts } from "@/lib/mdx";
 export async function GET() {
   const posts = await getAllPosts();
   const siteUrl =
-    process.env.NEXT_PUBLIC_SITE_URL || "https://mattiapirazzidev.vercel.app/";
+    process.env.NEXT_PUBLIC_SITE_URL || "https://mattiapirazzi.dev";
 
   const rssItems = posts
     .map(
