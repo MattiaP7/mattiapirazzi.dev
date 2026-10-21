@@ -2,6 +2,7 @@ import Link from "next/link";
 import { Calendar, Clock, ArrowRight } from "lucide-react";
 import type { PostFrontMatter } from "@/lib/mdx";
 import { formatDate } from "@/lib/utils";
+import { ViewCounter } from "@/components/view-counter";
 
 interface BlogCardProps {
   slug: string;
@@ -21,6 +22,9 @@ export function BlogCard({ slug, frontmatter, readingTime }: BlogCardProps) {
         <span className="flex items-center gap-1.5">
           <Clock className="w-3.5 h-3.5" />
           {readingTime} min
+        </span>
+        <span className="flex items-center gap-1.5">
+          <ViewCounter slug={slug} trackView={false} />
         </span>
       </div>
 

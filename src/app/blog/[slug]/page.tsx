@@ -27,6 +27,8 @@ import { TableOfContents } from "@/components/toc";
 import { SeriesBox } from "@/components/series-box"; // NUOVO
 import { BlogCard } from "@/components/blog-card"; // NUOVO
 import { Metadata } from "next";
+import { Comments } from "@/components/comments";
+import { ViewCounter } from "@/components/view-counter";
 
 interface PostPageProps {
   params: Promise<{ slug: string }>;
@@ -139,6 +141,9 @@ export default async function PostPage({ params }: PostPageProps) {
                 <Clock className="w-4 h-4" />
                 {post.readingTime} min
               </span>
+              <span className="flex items-center gap-1.5">
+                <ViewCounter slug={slug} trackView={true} />
+              </span>
             </div>
           </header>
 
@@ -246,6 +251,8 @@ export default async function PostPage({ params }: PostPageProps) {
               </div>
             )}
           </div>
+
+          <Comments />
         </article>
 
         <aside className="hidden lg:block w-64 shrink-0">
