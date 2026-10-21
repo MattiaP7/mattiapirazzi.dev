@@ -12,6 +12,7 @@
     "@giscus/react": "^3.1.0",
     "@shikijs/rehype": "^4.5.0",
     "@upstash/redis": "^1.39.0",
+    "@vercel/analytics": "^2.0.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "fuse.js": "^7.5.0",

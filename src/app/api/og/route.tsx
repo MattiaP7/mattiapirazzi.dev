@@ -10,6 +10,19 @@ export async function GET(req: NextRequest) {
   const description =
     searchParams.get("description") || "Informatica, C++ e Linux";
   const author = searchParams.get("author") || "Mattia Pirazzi";
+  const coverImage = searchParams.get("coverImage");
+
+  // Se l'immagine è un percorso relativo (es. /images/cover.png),
+  // costruiamo l'URL assoluto richiesto da Satori/next/og
+  let absoluteImageUrl: string | null = null;
+  if (coverImage) {
+    if (coverImage.startsWith("http://") || coverImage.startsWith("https://")) {
+      absoluteImageUrl = coverImage;
+    } else {
+      const origin = req.nextUrl.origin;
+      absoluteImageUrl = `${origin}${coverImage.startsWith("/") ? "" : "/"}${coverImage}`;
+    }
+  }
 
   return new ImageResponse(
     <div
@@ -24,6 +37,7 @@ export async function GET(req: NextRequest) {
         padding: "60px 80px",
         fontFamily: "sans-serif",
         border: "1px solid #262626",
+        position: "relative",
       }}
     >
       {/* Background Grid Accent */}
@@ -60,39 +74,78 @@ export async function GET(req: NextRequest) {
         </span>
       </div>
 
-      {/* Corpo centrale: Titolo e Descrizione */}
+      {/* Corpo centrale: Layout Flessibile (Con o Senza Immagine) */}
       <div
         style={{
           display: "flex",
-          flexDirection: "column",
-          gap: "16px",
+          flexDirection: "row",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: "40px",
           zIndex: 10,
         }}
       >
-        <h1
+        {/* Testo (Titolo + Descrizione) */}
+        <div
           style={{
-            fontSize: "56px",
-            fontWeight: 800,
-            lineHeight: 1.1,
-            letterSpacing: "-0.03em",
-            color: "#f5f5f5",
-            margin: 0,
+            display: "flex",
+            flexDirection: "column",
+            gap: "16px",
+            flex: 1,
           }}
         >
-          {title}
-        </h1>
-        <p
-          style={{
-            fontSize: "24px",
-            color: "#a3a3a3",
-            margin: 0,
-            lineHeight: 1.4,
-            maxHeight: "68px",
-            overflow: "hidden",
-          }}
-        >
-          {description}
-        </p>
+          <h1
+            style={{
+              fontSize: absoluteImageUrl ? "46px" : "56px",
+              fontWeight: 800,
+              lineHeight: 1.1,
+              letterSpacing: "-0.03em",
+              color: "#f5f5f5",
+              margin: 0,
+            }}
+          >
+            {title}
+          </h1>
+          <p
+            style={{
+              fontSize: "22px",
+              color: "#a3a3a3",
+              margin: 0,
+              lineHeight: 1.4,
+              maxHeight: "68px",
+              overflow: "hidden",
+            }}
+          >
+            {description}
+          </p>
+        </div>
+
+        {/* Anteprima Cover Image (se presente) */}
+        {absoluteImageUrl && (
+          <div
+            style={{
+              display: "flex",
+              width: "360px",
+              height: "240px",
+              borderRadius: "16px",
+              overflow: "hidden",
+              border: "1px solid #333333",
+              boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.5)",
+              // shrink: 0,
+            }}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={absoluteImageUrl}
+              alt="Cover"
+              style={{
+                width: "100%",
+                height: "100%",
+                objectFit: "cover",
+              }}
+            />
+          </div>
+        )}
       </div>
 
       {/* Footer */}

@@ -14,7 +14,7 @@ export default async function HomePage() {
       <section className="space-y-6 max-w-2xl">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-neutral-200 dark:border-neutral-800 bg-neutral-50 dark:bg-neutral-900/50 text-xs font-mono text-neutral-600 dark:text-neutral-400">
           <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-          Informatica @ UniFe & System Development
+          Studente di informatica
         </div>
 
         <h1 className="text-4xl sm:text-5xl font-extrabold tracking-tight text-neutral-900 dark:text-neutral-100 leading-tight">
@@ -27,8 +27,8 @@ export default async function HomePage() {
             Mattia Pirazzi
           </strong>
           . In questo spazio raccolgo note tecniche, guide ed esperimenti su
-          C++23, programmazione di sistema UNIX, networking e personalizzazione
-          di Arch Linux.
+          C++23, programmazione di sistema UNIX, networking e tanto altro legato
+          all'informatica.
         </p>
 
         {/* Quick Links / Badges */}

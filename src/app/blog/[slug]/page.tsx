@@ -50,10 +50,22 @@ export async function generateMetadata({
 
   if (!post) return {};
 
-  const ogUrl = new URL("https://mattiapirazzi.dev/api/og");
-  ogUrl.searchParams.set("title", post.frontmatter.title);
-  ogUrl.searchParams.set("description", post.frontmatter.description);
-  ogUrl.searchParams.set("author", post.frontmatter.author);
+  const siteUrl =
+    process.env.NEXT_PUBLIC_SITE_URL || "https://mattiapirazzi.dev";
+
+  // Costruiamo le query param per la route OG
+  const ogSearchParams = new URLSearchParams({
+    title: post.frontmatter.title,
+    description: post.frontmatter.description,
+    author: post.frontmatter.author || "Mattia Pirazzi",
+  });
+
+  // Se esiste la coverImage nel frontmatter, la passiamo all'API OG
+  if (post.frontmatter.coverImage) {
+    ogSearchParams.set("coverImage", post.frontmatter.coverImage);
+  }
+
+  const ogImageUrl = `${siteUrl}/api/og?${ogSearchParams.toString()}`;
 
   return {
     title: post.frontmatter.title,
@@ -62,9 +74,10 @@ export async function generateMetadata({
       title: post.frontmatter.title,
       description: post.frontmatter.description,
       type: "article",
+      url: `${siteUrl}/blog/${slug}`,
       images: [
         {
-          url: ogUrl.toString(),
+          url: ogImageUrl,
           width: 1200,
           height: 630,
           alt: post.frontmatter.title,
@@ -75,7 +88,7 @@ export async function generateMetadata({
       card: "summary_large_image",
       title: post.frontmatter.title,
       description: post.frontmatter.description,
-      images: [ogUrl.toString()],
+      images: [ogImageUrl],
     },
   };
 }
