@@ -1,0 +1,192 @@
+---
+title: "Implementing Bubble Sort in Assembly"
+description: "A step-by-step analysis and implementation of the bubble sort algorithm, written in assembly."
+date: "2026-10-21"
+author: "Mattia Pirazzi"
+tags: ["assembly", "algorithms", "low-level"]
+---
+
+# Introduction
+
+When you become accustomed to writing "modern" C++ (C++20/23) — or even "plain" C — it is easy to grow dependent on the abstractions they provide. Compilers are capable of generating such highly optimized machine code that the way they dynamically allocate registers, unroll loops, or pre-calculate jumps can seem almost magical. Compilers like GCC or Clang do an incredible job of translating the "zero-cost" paradigms we rely on into highly efficient instructions, effectively shielding us from the raw, unvarnished mechanics of the hardware.
+
+But what happens when we strip away the STL, iterators, ranges, and even the standard `for` loops of C/C++, and return to getting our hands dirty on the "bare metal"?
+While sorting through some old files from my high school days, I stumbled upon a particular assembly file: an implementation of the bubble sort algorithm written in 32-bit x86 assembly (using NASM). Revisiting this code today—with a perspective shaped by working at a higher level of abstraction—offers a fascinating viewpoint.
+
+Down at that level, there are no libraries to save the day, nor are there compilers to patch gaps in our logic. There are only registers, memory offsets, conditional jumps, and the flags of the Arithmetic Logic Unit (ALU). In this post, we will dissect that old code line by line, examine how the CPU handles loops, and look at how it interprets negative numbers in binary using signed instructions.
+
+## A quick refresher: how does Bubble Sort work?
+
+Before we dive into the intricacies of registers, let’s have a quick conceptual recap. Bubble Sort is one of the simplest sorting algorithms (though it is less efficient for large datasets). It operates on a basic principle: repeatedly iterate through an array, compare adjacent pairs of elements, and swap them if they are in the wrong order.
+
+With each full pass, the largest element "bubbles" up (hence the name *Bubble Sort*) to its final position at the end of the array.
+
+Here is a visual representation of a single pass through a small, unsorted array:
+
+```text
+Initial array: [5, 1, 4, 2, 8]
+
+[5, 1, 4, 2, 8]  --> Compare 5 e 1 (5 > 1): Swap!
+ ^  ^
+[1, 5, 4, 2, 8]  --> Compare 5 e 4 (5 > 4): Swap!
+    ^  ^
+[1, 4, 5, 2, 8]  --> Compare 5 e 2 (5 > 2): Swap!
+       ^  ^
+[1, 4, 2, 5, 8]  --> Compare 5 e 8 (5 < 8): OK, no swap.
+          ^  ^
+
+State at the end of the pass: [1, 4, 2, 5, 8] (The 8 is now in its final position)
+```
+
+# Assembly Implementation
+
+Here is the complete code (developed and tested in SASM), which we will analyze shortly:
+
+```asm
+%include "io.inc"
+
+section .data
+    vet db 1,4,6,7,0,9,3,5,-4,-5,-6  ; The array consists of 11 elements
+
+section .text
+global CMAIN
+
+CMAIN:
+    mov ebp, esp      ; for correct debugging
+    xor eax, eax
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx
+
+    ; The array has N=11 elements; a maximum of N-1 = 10 passes are required
+    ; Set ch to 10 (number of comparisons for the first pass)
+    mov ch, 10
+
+cicloExt:
+    mov cl, ch        ; Initialize the inner loop counter
+    mov bl, 0         ; Reset the swap flag
+    mov edx, vet      ; Point to the first element of the array
+
+cicloInt:
+    mov al, [edx]     ; Load vet[i]
+    mov ah, [edx+1]   ; Load vet[i+1]
+    cmp al, ah        ; Compare vet[i] and vet[i+1]
+
+    jle salto         ; If vet[i] <= vet[i+1], they are in order.
+
+    ; If the program reaches this point, vet[i] > vet[i+1]: perform the swap
+    mov bl, 0xFF      ; Set the flag to indicate that a swap has occurred
+    call scambio
+
+salto:
+    inc edx           ; Move to the next pair
+    dec cl            ; Decrement the comparison counter
+    jnz cicloInt      ; If cl != 0, continue the inner loop
+
+    ; End of the pass: early-exit check
+    ; If bl is 0, no elements were swapped: the array is sorted
+
+    cmp bl, 0
+    jz fine
+
+    dec ch            ; Decrement the total number of comparisons for the next pass
+    jnz cicloExt      ; If ch > 0, start a new outer loop
+
+fine:
+    call print
+    NEWLINE
+
+    xor eax, eax
+    ret
+
+scambio:
+    mov [edx], ah     ; Write vet[i+1] to vet[i]
+    mov [edx+1], al   ; Write vet[i] to vet[i+1]
+    ret
+
+print:
+    push ax
+    push cx
+    push edx
+
+    mov cl, 11        ; 11 elements to print
+    mov edx, vet
+
+iter:
+    mov al, [edx]
+    PRINT_DEC 1, al
+    PRINT_CHAR " "
+    inc edx
+    dec cl
+    jnz iter
+
+    pop edx
+    pop cx
+    pop ax
+    ret
+```
+
+## Code Analysis
+
+### 1. Initialization and the XOR trick
+
+Everything begins in the `.data` section, where we define our array `vet` as a sequence of bytes (`db`). Note the presence of negative numbers—this detail will become crucial during the comparison operations.
+
+At the start of the `.text` section, after setting up the base frame for the debugger, we encounter this block:
+
+```asm
+xor eax, eax
+xor ebx, ebx
+xor ecx, ecx
+xor edx, edx
+```
+
+This is a classic technique in Assembly. Instead of using an instruction like `mov eax, 0` (which would require more bytes to encode the immediate operand `0`), we perform a logical XOR of the register with itself. This is the fastest and most byte-efficient operation for zeroing out a register before beginning to use its 8-bit sub-registers (`al`, `ah`, `cl`, etc.).
+
+### 2. Handling Nested Loops
+
+Bubble Sort requires two loops. To maximize efficiency, we use 8-bit registers as counters:
+
+* `ch` (Outer Loop): Starts at 10 (N-1 elements) and manages the total number of passes over the array.
+* `cl` (Inner Loop): In each pass, it takes the value of `ch` and is decremented as we compare pairs of numbers.
+
+```asm
+cicloExt:
+  mov cl, ch        ; Initialize the inner loop counter
+  mov bl, 0         ; Reset the swap flag
+  mov edx, vet      ; edx becomes our pointer to the array
+```
+
+This is where the "bare metal" nature truly shows: instead of an integer index like `int i = 0`, we use `edx` directly to store the memory address of the array's first element, which we will then increment manually.
+
+### 3. Comparisons, Conditional Jumps, and Negative Numbers
+
+The heart of the algorithm lies within the inner loop:
+
+```asm
+mov al, [edx]     ; Load vet[i]
+mov ah, [edx+1]   ; Load vet[i+1]
+cmp al, ah        ; Compare
+jle salto         ; Jump if Less or Equal
+```
+
+We extract two adjacent bytes from memory into the `al` and `ah` registers. The `cmp` instruction performs an implicit subtraction and sets the CPU flags.
+
+The next instruction, `jle` (Jump if Less or Equal), is vital. Why use `jle` instead of a simple `jb` (Jump if Below)? Because our array contains negative numbers. Jump instructions like `jl/jle` specifically check the sign flag (SF) and the overflow flag (OF), allowing the CPU to mathematically determine that, for instance, -6 is less than -4.
+
+### 4. Optimization: Early Exit
+
+A "naive" Bubble Sort would continue iterating through the array for all passes, even if it were already sorted after the first one. To avoid wasting clock cycles, we use the `bl` register as a boolean flag:
+
+```asm
+cmp bl, 0
+jz fine           ; Jump if Zero
+```
+
+If the inner loop finishes and `bl` is still zero (meaning the swap operation was never called), it indicates that the array is fully sorted. At that point, we execute a `jz` (jump if zero) to jump directly to the end of the program, cutting short any unnecessary passes.
+
+## Conclusion
+
+This simple file reminded me of the vast amount of invisible work the compiler performs for us every single day. Handling memory addressing manually—and ensuring that the final element in a loop isn't overlooked (as evidenced by `cl = 11` in the `print` block)—requires pinpoint precision.
+
+Returning to these fundamentals from time to time is perhaps the best way to truly appreciate and fully leverage the high-level tools we use in our daily work.

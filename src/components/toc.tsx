@@ -33,6 +33,31 @@ export function TableOfContents({ toc }: TableOfContentsProps) {
     return () => observer.disconnect();
   }, [toc]);
 
+  // Gestore del click per lo scroll fluido con offset
+  const handleScroll = (
+    e: React.MouseEvent<HTMLAnchorElement>,
+    url: string,
+  ) => {
+    e.preventDefault(); // Previene il salto istantaneo di default
+    const targetId = url.substring(1);
+    const element = document.getElementById(targetId);
+
+    if (element) {
+      // Offset di 80px per compensare l'altezza della navbar sticky
+      const offset = 80;
+      const elementPosition = element.getBoundingClientRect().top;
+      const offsetPosition = elementPosition + window.scrollY - offset;
+
+      window.scrollTo({
+        top: offsetPosition,
+        behavior: "smooth",
+      });
+
+      // Aggiorna l'URL nel browser (es. #titolo) senza ricaricare
+      window.history.pushState(null, "", url);
+    }
+  };
+
   if (toc.length === 0) return null;
 
   return (
@@ -45,6 +70,7 @@ export function TableOfContents({ toc }: TableOfContentsProps) {
           <li key={index} style={{ paddingLeft: `${(item.level - 2) * 1}rem` }}>
             <Link
               href={item.url}
+              onClick={(e) => handleScroll(e, item.url)}
               className={cn(
                 "block truncate transition-colors hover:text-blue-600 dark:hover:text-blue-400",
                 activeId === item.url.substring(1)

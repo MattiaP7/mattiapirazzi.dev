@@ -9,8 +9,9 @@ import {
   getPostBySlug,
   getPostsSlugs,
   getTableOfContents,
-  getAdjacentPosts, // NUOVO
-  getRelatedPosts, // NUOVO
+  getAdjacentPosts,
+  getRelatedPosts,
+  hasEnglishTranslation,
 } from "@/lib/mdx";
 import { formatDate, slugify } from "@/lib/utils";
 import { mdxComponents } from "@/components/mdx-components";
@@ -21,17 +22,20 @@ import {
   User,
   Tag,
   Clock,
-} from "lucide-react"; // Aggiunto ArrowRight
+  Globe,
+} from "lucide-react";
 import { ReadingProgress } from "@/components/reading-progress";
 import { TableOfContents } from "@/components/toc";
-import { SeriesBox } from "@/components/series-box"; // NUOVO
-import { BlogCard } from "@/components/blog-card"; // NUOVO
+import { SeriesBox } from "@/components/series-box";
+import { BlogCard } from "@/components/blog-card";
 import { Metadata } from "next";
 import { Comments } from "@/components/comments";
 import { ViewCounter } from "@/components/view-counter";
 
 interface PostPageProps {
   params: Promise<{ slug: string }>;
+  // NUOVO: Aggiunto searchParams per leggere ?lang=en
+  searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
 }
 
 export async function generateStaticParams() {
@@ -39,28 +43,28 @@ export async function generateStaticParams() {
   return slugs.map((slug) => ({ slug }));
 }
 
-// ... (generateMetadata identico a prima) ...
 export async function generateMetadata({
   params,
-}: {
-  params: Promise<{ slug: string }>;
-}): Promise<Metadata> {
+  searchParams,
+}: PostPageProps): Promise<Metadata> {
   const { slug } = await params;
-  const post = await getPostBySlug(slug);
+  const resolvedSearchParams = await searchParams;
+
+  // NUOVO: Determinazione della lingua dai parametri
+  const currentLang = resolvedSearchParams?.lang === "en" ? "en" : "it";
+  const post = getPostBySlug(slug, currentLang); // Passata la lingua
 
   if (!post) return {};
 
   const siteUrl =
     process.env.NEXT_PUBLIC_SITE_URL || "https://mattiapirazzi.dev";
 
-  // Costruiamo le query param per la route OG
   const ogSearchParams = new URLSearchParams({
     title: post.frontmatter.title,
     description: post.frontmatter.description,
     author: post.frontmatter.author || "Mattia Pirazzi",
   });
 
-  // Se esiste la coverImage nel frontmatter, la passiamo all'API OG
   if (post.frontmatter.coverImage) {
     ogSearchParams.set("coverImage", post.frontmatter.coverImage);
   }
@@ -93,17 +97,25 @@ export async function generateMetadata({
   };
 }
 
-export default async function PostPage({ params }: PostPageProps) {
+export default async function PostPage({
+  params,
+  searchParams,
+}: PostPageProps) {
   const { slug } = await params;
-  const post = getPostBySlug(slug);
+  const resolvedSearchParams = await searchParams;
+
+  // NUOVO: Determinazione della lingua e recupero post localizzato
+  const currentLang = resolvedSearchParams?.lang === "en" ? "en" : "it";
+  const post = getPostBySlug(slug, currentLang);
 
   if (!post) {
     notFound();
   }
 
+  const hasEnglish = hasEnglishTranslation(slug);
+
   const toc = getTableOfContents(post.content);
 
-  // NUOVO: Estrazione dati per il footer dell'articolo
   const { prev, next } = getAdjacentPosts(post.slug);
   const relatedPosts = getRelatedPosts(post, 2);
 
@@ -121,7 +133,6 @@ export default async function PostPage({ params }: PostPageProps) {
             Torna alla home
           </Link>
 
-          {/* ... (Header e CoverImage identici a prima) ... */}
           <header className="space-y-4 pb-8 border-b border-neutral-200 dark:border-neutral-800">
             <div className="flex flex-wrap gap-2">
               {post.frontmatter.tags?.map((tag) => (
@@ -158,6 +169,33 @@ export default async function PostPage({ params }: PostPageProps) {
                 <ViewCounter slug={slug} trackView={true} />
               </span>
             </div>
+
+            {/* NUOVO: Switcher Lingua integrato nell'header */}
+            {hasEnglish && (
+              <div className="flex items-center gap-2 text-sm font-mono pt-4 mt-4 border-t border-neutral-100 dark:border-neutral-800/50">
+                <Globe className="w-4 h-4 text-neutral-500" />
+                <Link
+                  href={`/blog/${slug}`}
+                  className={`px-2 py-1 rounded transition-colors ${
+                    currentLang === "it"
+                      ? "bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900"
+                      : "text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                  }`}
+                >
+                  IT
+                </Link>
+                <Link
+                  href={`/blog/${slug}?lang=en`}
+                  className={`px-2 py-1 rounded transition-colors ${
+                    currentLang === "en"
+                      ? "bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900"
+                      : "text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                  }`}
+                >
+                  EN
+                </Link>
+              </div>
+            )}
           </header>
 
           <div className="prose prose-neutral dark:prose-invert max-w-none mt-8 prose-pre:p-0 prose-pre:bg-transparent">
@@ -167,10 +205,9 @@ export default async function PostPage({ params }: PostPageProps) {
                 currentSlug={post.slug}
               />
             )}
-                     {" "}
+
             {post.frontmatter.coverImage && (
               <div className="relative aspect-video mt-8 overflow-hidden rounded-xl border border-neutral-200 dark:border-neutral-800">
-                             {" "}
                 <Image
                   src={post.frontmatter.coverImage}
                   alt={post.frontmatter.title}
@@ -179,7 +216,6 @@ export default async function PostPage({ params }: PostPageProps) {
                   sizes="(min-width: 1024px) 1024px, 100vw"
                   className="object-cover"
                 />
-                           {" "}
               </div>
             )}
             <MDXRemote
@@ -194,7 +230,7 @@ export default async function PostPage({ params }: PostPageProps) {
                       rehypeShiki,
                       {
                         themes: {
-                          dark: "gruvbox-dark-hard",
+                          dark: "tokyo-night",
                           light: "github-light",
                         },
                         defaultColor: false,
@@ -206,9 +242,7 @@ export default async function PostPage({ params }: PostPageProps) {
             />
           </div>
 
-          {/* NUOVO: Navigazione e Articoli Correlati a fine pagina */}
           <div className="mt-16 pt-8 border-t border-neutral-200 dark:border-neutral-800 space-y-12">
-            {/* Post Precedente / Successivo */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               {next ? (
                 <Link
@@ -245,7 +279,6 @@ export default async function PostPage({ params }: PostPageProps) {
               )}
             </div>
 
-            {/* Articoli Correlati (Griglia) */}
             {relatedPosts.length > 0 && (
               <div>
                 <h3 className="text-xl font-bold text-neutral-900 dark:text-neutral-100 mb-6">

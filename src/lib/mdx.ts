@@ -35,7 +35,7 @@ export function getPostsSlugs(): string[] {
   const files = getAllFilesRecursively(contentDir);
 
   return files
-    .filter((file) => file.endsWith(".mdx"))
+    .filter((file) => file.endsWith(".mdx") && !file.endsWith(".en.mdx"))
     .map((file) => {
       const fileName = path.basename(file, ".mdx");
       // Se è un bundle (index.mdx), usa il nome della cartella come slug
@@ -45,7 +45,10 @@ export function getPostsSlugs(): string[] {
     });
 }
 
-export function getPostBySlug(slug: string): Post | null {
+export function getPostBySlug(
+  slug: string,
+  lang: "it" | "en" = "it",
+): Post | null {
   try {
     if (!fs.existsSync(contentDir)) return null;
 
@@ -53,13 +56,31 @@ export function getPostBySlug(slug: string): Post | null {
       f.endsWith(".mdx"),
     );
 
-    // Trova l'esatto file MDX che corrisponde allo slug ovunque si trovi
-    const targetFile = files.find((file) => {
-      const fileName = path.basename(file, ".mdx");
-      const fileSlug =
-        fileName === "index" ? path.basename(path.dirname(file)) : fileName;
-      return fileSlug === slug;
-    });
+    let targetFile;
+
+    // 1. Se la lingua richiesta è inglese, cerchiamo il file localizzato
+    if (lang === "en") {
+      targetFile = files.find((file) => {
+        const fileName = path.basename(file);
+        const isFile = fileName === `${slug}.en.mdx`;
+        const isIndex =
+          fileName === "index.en.mdx" &&
+          path.basename(path.dirname(file)) === slug;
+        return isFile || isIndex;
+      });
+    }
+
+    // 2. Fallback all'italiano: se abbiamo cercato 'en' e non esiste, o se la lingua base è 'it'
+    if (!targetFile) {
+      targetFile = files.find((file) => {
+        const fileName = path.basename(file);
+        const isFile = fileName === `${slug}.mdx`;
+        const isIndex =
+          fileName === "index.mdx" &&
+          path.basename(path.dirname(file)) === slug;
+        return isFile || isIndex;
+      });
+    }
 
     if (!targetFile) return null;
 
@@ -202,4 +223,18 @@ export function getRelatedPosts(currentPost: Post, limit = 2): Post[] {
     })
     .slice(0, limit)
     .map((item) => item.post);
+}
+
+export function hasEnglishTranslation(slug: string): boolean {
+  if (!fs.existsSync(contentDir)) return false;
+
+  const files = getAllFilesRecursively(contentDir);
+
+  return files.some((file) => {
+    const fileName = path.basename(file);
+    const isFile = fileName === `${slug}.en.mdx`;
+    const isIndex =
+      fileName === "index.en.mdx" && path.basename(path.dirname(file)) === slug;
+    return isFile || isIndex;
+  });
 }

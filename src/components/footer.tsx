@@ -35,7 +35,7 @@ export async function Footer() {
               </span>
             </div>
             <p className="text-neutral-500 leading-relaxed">
-              Sviluppatore C++, Linux enthusiast e studente di Computer Science.
+              Sviluppatore C++, Linux user e studente di Computer Science.
               Scrivo di sistemi, networking e low-level programming.
             </p>
           </div>

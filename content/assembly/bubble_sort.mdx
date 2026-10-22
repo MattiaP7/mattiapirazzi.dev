@@ -1,0 +1,193 @@
+---
+title: "Implementazione del bubble sort in assembly"
+description: "Analisi e implementazione step by step del bubble sort, scritto in assembly."
+date: "2026-10-21"
+author: "Mattia Pirazzi"
+tags: ["assembly", "algoritmi", "low-level"]
+---
+
+# Introduzione
+
+Quando ti abitui a scrivere C++ "moderno" 20/23, ma anche del "semplice" C è facile assuefarsi alle astrazioni che offrono, i compilatori riescono a scrivere codice macchina così ottimizzato da far sembrare quasi magico il modo in cui allocano dinamicamente i registri, srotolano i cicli (loop unrolling) o calcolano in anticipo i salti. Compilatori come GCC o Clang fanno un lavoro spaventoso nel tradurre i paradigmi zero-cost a cui siamo abituati in istruzioni efficientissime, finendo per nasconderci la nuda e cruda meccanica dell'hardware.
+
+Ma cosa succede quando togliamo di mezzo la STL, gli iteratori, i range o anche solo i semplici cicli for del C/C++, e torniamo a sporcarci le mani direttamente sul bare metal.
+Facendo ordine tra vecchi file delle superiori, mi è saltato all'occhio un particolare file asm: una implementazione del bubble sort scritta in assembly x86 a 32bit (NASM). Rileggere questo codice oggi, con un occhio "abituato" a scrivere con un livello di astrazione superiore offre una prospettiva affascinante.
+
+Laggiù non ci sono librerie a salvarci la vita o compilatori a tappare le falle della nostra logica. Ci sono solo registri, offset di memoria, salti condizionati e i flag della Arithmetic Logic Unit (ALU). In questo post andremo a dissezionare quel vecchio codice riga per riga, vedremo come la CPU gestisce i cicli, e come interpreta i numeri negativi in binario tramite le istruzioni con segno.
+
+## Ripasso veloce: come funziona il Bubble Sort?
+
+Prima di addentrarci nei meandri dei registri, facciamo un rapido recap concettuale. Il Bubble Sort è uno degli algoritmi di ordinamento più semplici (anche se meno efficienti per grandi moli di dati). Il suo funzionamento si basa su un principio elementare: scorrere ripetutamente l'array, confrontare le coppie di elementi adiacenti e scambiarli se sono nell'ordine sbagliato.
+
+Ad ogni passata completa, l'elemento più grande "bolle" (da qui *bubble*) verso la sua posizione finale in fondo all'array. 
+
+Ecco una rappresentazione visiva di una singola passata su un piccolo array disordinato:
+
+```text
+Array iniziale: [5, 1, 4, 2, 8]
+
+[5, 1, 4, 2, 8]  --> Confronta 5 e 1 (5 > 1): Scambia!
+ ^  ^
+[1, 5, 4, 2, 8]  --> Confronta 5 e 4 (5 > 4): Scambia!
+    ^  ^
+[1, 4, 5, 2, 8]  --> Confronta 5 e 2 (5 > 2): Scambia!
+       ^  ^
+[1, 4, 2, 5, 8]  --> Confronta 5 e 8 (5 < 8): OK, non scambiare.
+          ^  ^
+
+Stato a fine passata: [1, 4, 2, 5, 8] (L'8 è ora nella sua posizione definitiva)
+```
+
+# Implementazione in assembly
+
+Ecco il codice completo (sviluppato e testato su SASM), che analizzeremo a breve:
+
+```asm
+%include "io.inc"
+
+section .data
+    vet db 1,4,6,7,0,9,3,5,-4,-5,-6  ; L'array è composto da 11 elementi
+
+section .text
+global CMAIN
+
+CMAIN:
+    mov ebp, esp      ; for correct debugging
+    xor eax, eax
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx
+
+    ; L'array ha N=11 elementi, servono al massimo N-1 = 10 passate
+    ; Imposta ch a 10 (numero di confronti della prima passata)
+    mov ch, 10
+
+cicloExt:
+    mov cl, ch        ; Inizializza il contatore del ciclo interno
+    mov bl, 0         ; Azzera il flag di scambio
+    mov edx, vet      ; Punta al primo elemento dell'array
+
+cicloInt:
+    mov al, [edx]     ; Carica vet[i]
+    mov ah, [edx+1]   ; Carica vet[i+1]
+    cmp al, ah        ; Confronta vet[i] e vet[i+1]
+
+    jle salto         ; Se vet[i] <= vet[i+1] sono ordinati.
+                      ; (Uso jle invece di jl per non scambiare numeri uguali)
+
+    ; Se il programma arriva qui, vet[i] > vet[i+1]: esegue lo scambio
+    mov bl, 0xFF      ; Imposta il flag per indicare che c'è stato uno scambio
+    call scambio
+
+salto:
+    inc edx           ; Passa alla coppia successiva
+    dec cl            ; Decrementa il contatore dei confronti
+    jnz cicloInt      ; Se cl != 0, continua il ciclo interno
+
+    ; Fine della passata: controllo early-exit
+    ; Se bl è 0, nessun elemento è stato scambiato: array ordinato
+
+    cmp bl, 0
+    jz fine
+
+    dec ch            ; Decrementa i confronti totali per la prossima passata
+    jnz cicloExt      ; Se ch > 0, inizia un nuovo ciclo esterno
+
+fine:
+    call print
+    NEWLINE
+
+    xor eax, eax
+    ret
+
+scambio:
+    mov [edx], ah     ; Scrive vet[i+1] in vet[i]
+    mov [edx+1], al   ; Scrive vet[i] in vet[i+1]
+    ret
+
+print:
+    push ax
+    push cx
+    push edx
+
+    mov cl, 11        ; 11 elementi da stampare
+    mov edx, vet
+
+iter:
+    mov al, [edx]
+    PRINT_DEC 1, al
+    PRINT_CHAR " "
+    inc edx
+    dec cl
+    jnz iter
+
+    pop edx
+    pop cx
+    pop ax
+    ret
+```
+
+## Analisi del Codice
+
+### 1. Inizializzazione e il trucco dello XOR
+
+Tutto inizia nella sezione `.data`, dove definiamo il nostro array `vet` come una sequenza di byte (`db`). Notate la presenza di numeri negativi: questo dettaglio diventerà fondamentale durante i confronti.
+
+All'inizio della sezione `.text`, dopo aver impostato il frame base per il debugger, troviamo questo blocco:
+
+```asm
+xor eax, eax
+xor ebx, ebx
+xor ecx, ecx
+xor edx, edx
+```
+
+Questa è una tecnica classica in Assembly. Invece di usare un'istruzione come `mov eax, 0` (che richiederebbe più byte per codificare l'operando immediato `0`), applichiamo uno XOR logico del registro con se stesso. È l'operazione più veloce ed efficiente a livello di byte per azzerare un registro prima di iniziare a usarne i suoi sotto-registri a 8-bit (`al`, `ah`, `cl`, ecc.).
+
+### 2. Gestione dei Cicli Annidati
+
+Il Bubble Sort necessita di due cicli. Per massimizzare l'efficienza, utilizziamo i registri a 8-bit come contatori:
+
+* `ch` (Ciclo Esterno): Parte da 10 (N-1 elementi) e gestisce il numero di passate totali sull'array.
+* `cl` (Ciclo Interno): Ad ogni passata prende il valore di `ch` e viene decrementato man mano che confrontiamo le coppie di numeri.
+
+```asm
+cicloExt: 
+    mov cl, ch        ; Inizializza il contatore del ciclo interno
+    mov bl, 0         ; Azzera il flag di scambio
+    mov edx, vet      ; edx diventa il nostro puntatore all'array
+```
+
+Qui si nota il vero "bare metal": invece di un indice intero come `int i = 0`, usiamo direttamente `edx` per immagazzinare l'indirizzo di memoria del primo elemento dell'array, che incrementeremo manualmente.
+
+### 3. Confronti, Salti Condizionati e Numeri Negativi
+
+Il cuore dell'algoritmo si trova nel ciclo interno:
+
+```asm
+    mov al, [edx]     ; Carica vet[i]
+    mov ah, [edx+1]   ; Carica vet[i+1]
+    cmp al, ah        ; Confronta
+    jle salto         ; Jump if Less or Equal
+```
+
+Estraiamo due byte adiacenti in memoria nei registri `al` e `ah`. L'istruzione `cmp` esegue una sottrazione nascosta e imposta i flag nella CPU.
+
+L'istruzione successiva, `jle` (Jump if Less or Equal), è vitale. Perché usare `jle` e non un semplice `jb` (Jump if Below)? Perché il nostro array contiene numeri negativi. Le istruzioni di salto come `jl/jle` controllano specificamente i flag di segno (SF) e di overflow (OF), permettendo alla CPU di capire matematicamente che, ad esempio, -6 è minore di -4.
+
+### 4. L'Ottimizzazione: Early Exit
+
+Un Bubble Sort "stupido" scorrerebbe l'array per tutte le passate anche se questo fosse già ordinato al primo giro. Per evitare cicli di clock sprecati, usiamo il registro `bl` come booleano (Flag):
+
+```asm
+    cmp bl, 0         
+    jz fine           ; Jump if Zero
+```
+
+Se il ciclo interno finisce e `bl` è ancora a zero (ovvero non è mai stata chiamata la funzione di scambio), significa che l'array è completamente ordinato. A quel punto eseguiamo un `jz` (salta se zero) direttamente alla fine del programma, interrompendo le passate inutili.
+
+## Conclusione
+
+Questo semplice file mi ha ricordato quanto lavoro invisibile faccia il compilatore per noi ogni giorno. Gestire l'indirizzamento di memoria manualmente e preoccuparsi di non tralasciare l'ultimo elemento in un ciclo (`cl = 11` nel blocco `print` docet) richiede una precisione millimetrica.
+
+Tornare a queste basi, di tanto in tanto, è forse il modo migliore per apprezzare e sfruttare davvero a fondo gli strumenti di alto livello che usiamo nel quotidiano.
