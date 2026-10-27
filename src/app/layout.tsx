@@ -6,6 +6,7 @@ import { Navbar } from "@/components/navbar";
 import { Footer } from "@/components/footer";
 import { Analytics } from "@vercel/analytics/next";
 import { SpeedInsights } from "@vercel/speed-insights/next";
+import { Providers } from "@/components/providers";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -46,13 +47,15 @@ export default function RootLayout({
           enableSystem
           disableTransitionOnChange
         >
-          <Navbar />
-          <main className="flex-1 max-w-6xl w-full mx-auto px-4 py-8">
-            {children}
-          </main>
-          <Analytics />
-          <SpeedInsights />
-          <Footer />
+          <Providers>
+            <Navbar />
+            <main className="flex-1 max-w-6xl w-full mx-auto px-4 py-8">
+              {children}
+            </main>
+            <Analytics />
+            <SpeedInsights />
+            <Footer />
+          </Providers>
         </ThemeProvider>
       </body>
     </html>

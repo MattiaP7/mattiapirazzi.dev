@@ -94,3 +94,16 @@ pre.shiki code .line::before {
 html.dark pre.shiki code .line::before {
   color: var(--color-neutral-600);
 }
+
+/* ---------- Selezione del testo dentro i blocchi di codice ---------- */
+html.dark pre.shiki ::selection,
+html.dark pre.shiki span::selection {
+  background-color: #364a82 !important;
+  /* Colore selezione Tokyo Night */
+}
+
+html:not(.dark) pre.shiki ::selection,
+html:not(.dark) pre.shiki span::selection {
+  background-color: var(--color-blue-200) !important;
+  /* Colore selezione per github-light */
+}
